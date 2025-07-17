@@ -19,7 +19,7 @@ type MigrationRecord struct {
 	MigratedAt     time.Time
 }
 
-/func OpenDB(dbPath string) (*sql.DB, error) {
+func OpenDB(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("[数据库] 打开数据库失败: %w", err)
