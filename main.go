@@ -24,7 +24,7 @@ func setupLogger(logConfig LogConfig) error {
 			logger.SetOutput(io.MultiWriter(os.Stdout, file)) // Log to both console and file
 		} else {
 			logger.SetOutput(os.Stdout) // Fallback to console if file fails
-			fmt.Printf("Failed to log to file %s, using default stdout: %v\n", logConfig.OutputFile, err)
+			fmt.Printf("日志记录失败 %s, 输出到标准输出: %v\n", logConfig.OutputFile, err)
 		}
 	} else {
 		logger.SetOutput(os.Stdout)
@@ -44,7 +44,7 @@ func setupLogger(logConfig LogConfig) error {
 	level, err := logrus.ParseLevel(logConfig.Level)
 	if err != nil {
 		logger.SetLevel(logrus.InfoLevel) // Default to Info if level parsing fails
-		logger.Warnf("Invalid log level '%s', defaulting to 'info'. Error: %v", logConfig.Level, err)
+		logger.Warnf("日志等级不正确 '%s', 使用缺省的 'info'. Error: %v", logConfig.Level, err)
 	} else {
 		logger.SetLevel(level)
 	}
@@ -52,80 +52,62 @@ func setupLogger(logConfig LogConfig) error {
 }
 
 func main() {
-	var cfg Config // Declare the main Config struct
+	var cfg Config 
+	configFile := flag.String("config", "config.yaml", "YAML配置文件路径，配置文件优先级大于命令行。")
 
-	// 1. Define command-line flags and bind them directly to the Config struct fields.
-	//    The default values for these flags are empty/zero, which allows YAML to overwrite.
-	//    Only the config file path needs a non-empty default if we want to search for it.
-	configFile := flag.String("config", "config.yaml", "Path to the YAML configuration file. Configuration from this file will override command-line arguments.")
+	flag.StringVar(&cfg.SourceS3.Endpoint, "src-endpoint", "", "源S3的endpoint (e.g., s3.amazonaws.com)")
+	flag.StringVar(&cfg.SourceS3.AccessKeyID, "src-access-key", "", "源S3的access key")
+	flag.StringVar(&cfg.SourceS3.SecretAccessKey, "src-secret-key", "", "源S3的secret key")
+	flag.StringVar(&cfg.SourceS3.Bucket, "src-bucket", "", "源S3的bucket名")
+	flag.BoolVar(&cfg.SourceS3.UseSSL, "src-ssl", true, "是否使用SSL连接源服务")
 
-	// Source S3 Configuration Flags
-	flag.StringVar(&cfg.SourceS3.Endpoint, "src-endpoint", "", "Source S3 endpoint (e.g., s3.amazonaws.com)")
-	flag.StringVar(&cfg.SourceS3.AccessKeyID, "src-access-key", "", "Source S3 access key ID")
-	flag.StringVar(&cfg.SourceS3.SecretAccessKey, "src-secret-key", "", "Source S3 secret access key")
-	flag.StringVar(&cfg.SourceS3.Bucket, "src-bucket", "", "Source S3 bucket name")
-	flag.BoolVar(&cfg.SourceS3.UseSSL, "src-ssl", true, "Use SSL for source S3 connection")
+	flag.StringVar(&cfg.DestinationS3.Endpoint, "dest-endpoint", "", "目标S3的endpoint (e.g., s3.us-west-1.amazonaws.com)")
+	flag.StringVar(&cfg.DestinationS3.AccessKeyID, "dest-access-key", "", "目标S3的access key")
+	flag.StringVar(&cfg.DestinationS3.SecretAccessKey, "dest-secret-key", "", "目标S3的secret key")
+	flag.StringVar(&cfg.DestinationS3.Bucket, "dest-bucket", "", "目标S3的bucket名")
+	flag.BoolVar(&cfg.DestinationS3.UseSSL, "dest-ssl", true, "是否使用SSL连接目标服务")
 
-	// Destination S3 Configuration Flags
-	flag.StringVar(&cfg.DestinationS3.Endpoint, "dest-endpoint", "", "Destination S3 endpoint (e.g., s3.us-west-1.amazonaws.com)")
-	flag.StringVar(&cfg.DestinationS3.AccessKeyID, "dest-access-key", "", "Destination S3 access key ID")
-	flag.StringVar(&cfg.DestinationS3.SecretAccessKey, "dest-secret-key", "", "Destination S3 secret access key")
-	flag.StringVar(&cfg.DestinationS3.Bucket, "dest-bucket", "", "Destination S3 bucket name")
-	flag.BoolVar(&cfg.DestinationS3.UseSSL, "dest-ssl", true, "Use SSL for destination S3 connection")
+	flag.IntVar(&cfg.Migration.Concurrency, "concurrency", 0, "迁移进程的并发数(缺省: 4)")
+	flag.StringVar(&cfg.Migration.DBPath, "db-path", "", "记录迁移状态的SQLite数据库文件名(缺省: migration.db)")
 
-	// Migration Configuration Flags
-	flag.IntVar(&cfg.Migration.Concurrency, "concurrency", 0, "Number of concurrent file migrations (default: 5 if not set)")
-	flag.StringVar(&cfg.Migration.DBPath, "db-path", "", "Path to SQLite database file for progress tracking (default: migration.db if not set)")
+	flag.StringVar(&cfg.Logging.Level, "log-level", "", "日志等级: debug, info, warn, error (缺省: info )")
+	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "日志文件路径 (如果为空的话，输出到控制台)")
+	flag.StringVar(&cfg.Logging.Format, "log-format", "", "日志类型: text 或者 json (缺省: text)")
 
-	// Logging Configuration Flags
-	flag.StringVar(&cfg.Logging.Level, "log-level", "", "Log level: debug, info, warn, error (default: info if not set)")
-	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "Path to log file (empty for console only)")
-	flag.StringVar(&cfg.Logging.Format, "log-format", "", "Log format: text or json (default: text if not set)")
+	flag.Parse() 
 
-	flag.Parse() // Parse command-line arguments into `cfg`
-
-	// 2. Load Configuration from YAML file (if specified and exists)
-	//    This will overwrite values in `cfg` that are also present in the YAML.
 	err := LoadConfig(*configFile, &cfg)
 	if err != nil {
-		fmt.Printf("Failed to load configuration from %s: %v\n", *configFile, err)
+		fmt.Printf("读取配置文件出错 %s: %v\n", *configFile, err)
 		os.Exit(1)
 	}
 	if _, err := os.Stat(*configFile); err == nil {
-		fmt.Printf("Configuration loaded successfully from %s (overriding command-line arguments).\n", *configFile)
+		fmt.Printf("完成读取配置文件 %s (将覆盖命令行参数).\n", *configFile)
 	} else if os.IsNotExist(err) {
-		fmt.Printf("Config file %s not found. Proceeding with command-line arguments and default values.\n", *configFile)
+		fmt.Printf("配置文件 %s 不存在 %s. 使用命令行参数或者缺省值.\n", *configFile)
 	} else {
-		fmt.Printf("Error checking config file %s: %v. Proceeding with command-line arguments and default values.\n", *configFile, err)
+		fmt.Printf("配置文件格式有问题 %s: %v. 使用命令行参数或者缺省值.\n", *configFile, err)
 	}
 
-
-	// 3. Apply programmatic defaults for any values still empty/zero
 	cfg.ApplyDefaults()
-
-	// 4. Setup Logger based on final config
 	err = setupLogger(cfg.Logging)
 	if err != nil {
-		// If logger setup fails, we can't use logger, so fall back to fmt.Printf
-		fmt.Printf("Failed to setup logger: %v\n", err)
+		fmt.Printf("日志配置出错: %v\n", err)
 		os.Exit(1)
 	}
 
-	logger.Debugf("Final merged config: %+v", cfg)
-
-	// 5. Validate final configuration
+	logger.Debugf("配置: %+v", cfg)
 	if err := cfg.Validate(); err != nil {
-		logger.Fatalf("Invalid configuration: %v", err)
+		logger.Fatalf("配置有误: %v", err)
 	}
 
 	// 6. Open database
 	db, err := OpenDB(cfg.Migration.DBPath)
 	if err != nil {
-		logger.Fatalf("Failed to initialize database: %v", err)
+		logger.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
 
-	// 7. Initialize Migrator
 	migrator, err := NewMigrator(
 		cfg.SourceS3,
 		cfg.DestinationS3,
@@ -134,26 +116,23 @@ func main() {
 		logger, // Pass the configured logger
 	)
 	if err != nil {
-		logger.Fatalf("Failed to create migrator: %v", err)
+		logger.Fatalf("迁移进程初始化失败: %v", err)
 	}
 
-	// 8. Setup context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Listen for OS signals (Ctrl+C, etc.) to gracefully stop migration
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		logger.Info("Received termination signal. Attempting graceful shutdown...")
-		cancel() // Cancel the context to stop workers and listing
+		logger.Info("退出...")
+		cancel() 
 	}()
 
-	// 9. Start Migration
 	err = migrator.StartMigration(ctx)
 	if err != nil {
-		logger.Fatalf("Migration failed: %v", err)
+		logger.Fatalf("迁移失败: %v", err)
 	}
-	logger.Info("Migration tool finished.")
+	logger.Info("迁移完成.")
 }

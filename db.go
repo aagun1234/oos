@@ -3,13 +3,12 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"log" // Using standard log for DB-internal simple warnings for now
+	"log"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // Import for its side effects (driver registration)
+	_ "github.com/mattn/go-sqlite3"
 )
 
-// MigrationRecord represents a single file migration entry in the database.
 type MigrationRecord struct {
 	Path           string
 	SourceETag     string
@@ -20,15 +19,12 @@ type MigrationRecord struct {
 	MigratedAt     time.Time
 }
 
-// OpenDB opens a SQLite database connection.
-func OpenDB(dbPath string) (*sql.DB, error) {
+/func OpenDB(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("[数据库] 打开数据库失败: %w", err)
 	}
-	db.SetMaxOpenConns(1) // SQLite works best with a single connection for writes
-
-	// Create table if it doesn't exist
+	db.SetMaxOpenConns(1) // SQLite写操作单连接
 	schema := `
 	CREATE TABLE IF NOT EXISTS migrations (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,12 +39,11 @@ func OpenDB(dbPath string) (*sql.DB, error) {
 	_, err = db.Exec(schema)
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create table: %w", err)
+		return nil, fmt.Errorf("[数据库] 创建表失败: %w", err)
 	}
 	return db, nil
 }
 
-// RecordMigration saves or updates the migration status for an object.
 func RecordMigration(db *sql.DB, record MigrationRecord) error {
 	stmt, err := db.Prepare(`
 		INSERT OR REPLACE INTO migrations (
@@ -56,7 +51,7 @@ func RecordMigration(db *sql.DB, record MigrationRecord) error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?);
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to prepare statement: %w", err)
+		return fmt.Errorf("[数据库] 数据库错误: %w", err)
 	}
 	defer stmt.Close()
 
@@ -70,14 +65,12 @@ func RecordMigration(db *sql.DB, record MigrationRecord) error {
 		time.Now().Format(time.RFC3339),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to execute statement: %w", err)
+		return fmt.Errorf("[数据库] 执行失败: %w", err)
 	}
 	return nil
 }
 
-// GetMigrationStatus retrieves the migration status for a given object path.
-// Returns (record, true, nil) if found, (empty record, false, nil) if not found,
-// or (empty record, false, error) on error.
+
 func GetMigrationStatus(db *sql.DB, objectPath string) (MigrationRecord, bool, error) {
 	row := db.QueryRow(`
 		SELECT object_path, source_etag, source_size, destination_etag, destination_size, status, migrated_at
@@ -96,27 +89,26 @@ func GetMigrationStatus(db *sql.DB, objectPath string) (MigrationRecord, bool, e
 		&migratedAtStr,
 	)
 	if err == sql.ErrNoRows {
-		return MigrationRecord{}, false, nil // Not found
+		return MigrationRecord{}, false, nil 
 	}
 	if err != nil {
-		return MigrationRecord{}, false, fmt.Errorf("failed to query migration status: %w", err)
+		return MigrationRecord{}, false, fmt.Errorf("[数据库] 查询迁移信息失败: %w", err)
 	}
 
 	record.MigratedAt, err = time.Parse(time.RFC3339, migratedAtStr)
 	if err != nil {
-		// This is a minor issue, log a warning but don't fail the lookup
-		log.Printf("Warning: Could not parse timestamp for %s: %v", objectPath, err)
+		log.Printf("[数据库] 时间戳异常 %s: %v", objectPath, err)
 	}
 
 	return record, true, nil
 }
 
-// CountMigratedObjects counts the number of objects with a given status.
+
 func CountMigratedObjects(db *sql.DB, status string) (int, error) {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM migrations WHERE status = ?", status).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("failed to count objects: %w", err)
+		return 0, fmt.Errorf("[数据库] 获取对象数量失败: %w", err)
 	}
 	return count, nil
 }
