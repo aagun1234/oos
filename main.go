@@ -54,6 +54,8 @@ func setupLogger(logConfig LogConfig) error {
 func main() {
 	var cfg Config 
 	configFile := flag.String("config", "config.yaml", "YAML配置文件路径，配置文件优先级大于命令行。")
+	dryrun := flag.Bool("dry", false, "dry run mode, 不进行实际复制")
+	nolog := flag.Bool("no-log", false, "不在控制台输出日志")
 
 	flag.StringVar(&cfg.SourceS3.Endpoint, "src-endpoint", "", "源S3的endpoint (e.g., s3.amazonaws.com)")
 	flag.StringVar(&cfg.SourceS3.AccessKeyID, "src-access-key", "", "源S3的access key")
@@ -90,10 +92,15 @@ func main() {
 	}
 
 	cfg.ApplyDefaults()
-	err = setupLogger(cfg.Logging)
-	if err != nil {
-		fmt.Printf("日志配置出错: %v\n", err)
-		os.Exit(1)
+	if !*nolog {
+		err = setupLogger(cfg.Logging)
+		if err != nil {
+			fmt.Printf("日志配置出错: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		logger = logrus.New()
+		logger.SetOutput(io.Discard)
 	}
 
 	logger.Debugf("配置: %+v", cfg)
@@ -114,6 +121,7 @@ func main() {
 		db,
 		cfg.Migration.Concurrency,
 		logger, // Pass the configured logger
+		*dryrun,
 	)
 	if err != nil {
 		logger.Fatalf("迁移进程初始化失败: %v", err)

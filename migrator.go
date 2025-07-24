@@ -7,7 +7,7 @@ import (
 	//"io" 
 	"strings"
 	"sync"
-	//"time"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -23,9 +23,10 @@ type Migrator struct {
 	concurrency  int
 	prefix       string
 	logger       *logrus.Logger 
+	dryrun       bool
 }
 
-func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logger *logrus.Logger) (*Migrator, error) {
+func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logger *logrus.Logger, dryrun bool) (*Migrator, error) {
 	srcClient, err := minio.New(sourceCfg.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(sourceCfg.AccessKeyID, sourceCfg.SecretAccessKey, ""),
 		Secure: sourceCfg.UseSSL,
@@ -51,6 +52,7 @@ func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logge
 		prefix:       sourceCfg.Prefix,
 		concurrency:  concurrency,
 		logger:       logger, 
+		dryrun:       dryrun,
 	}, nil
 }
 
@@ -71,15 +73,24 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 	}
 	if !exists {
 		m.logger.WithField("bucket", m.destBucket).Info("目标桶不存在， 试图创建...")
-		err = m.destClient.MakeBucket(ctx, m.destBucket, minio.MakeBucketOptions{})
-		if err != nil {
-			return fmt.Errorf("目标桶创建失败 '%s': %w", m.destBucket, err)
+		if !m.dryrun {
+			err = m.destClient.MakeBucket(ctx, m.destBucket, minio.MakeBucketOptions{})
+			if err != nil {
+				return fmt.Errorf("目标桶创建失败 '%s': %w", m.destBucket, err)
+			}
+			m.logger.WithField("bucket", m.destBucket).Info("目标桶创建成功.")
+		} else {
+			m.logger.WithField("bucket", m.destBucket).Info("dryrun, 不创建目标桶.")
 		}
-		m.logger.WithField("bucket", m.destBucket).Info("目标桶创建成功.")
 	}
 
 	objectCh := make(chan minio.ObjectInfo, m.concurrency*2) 
 	var wg sync.WaitGroup
+	var (
+		objectCount int
+		totalSize int64
+		startTime = time.Now()
+	)
 
 	for i := 0; i < m.concurrency; i++ {
 		wg.Add(1)
@@ -99,23 +110,38 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 			Recursive: true, 
 		}
 
-		objectCount := 0
+		lastPrint := time.Now()
+		
 		for object := range m.sourceClient.ListObjects(listCtx, m.sourceBucket, opts) {
 			if object.Err != nil {
 				m.logger.WithError(object.Err).Warn("获取待迁移对象清单失败")
 				continue
 			}
 			
+			totalSize += object.Size
 			
 			select {
 			case objectCh <- object:
 				objectCount++
+				
+				// Print progress every 5 seconds
+				if time.Since(lastPrint) > 5*time.Second {
+					elapsed := time.Since(startTime).Seconds()
+					bps := float64(totalSize) / elapsed
+					
+					fmt.Printf("\r已迁移对象: %d/%d (%.2f MB/s)", objectCount, objectCount, bps/(1024*1024))
+					lastPrint = time.Now()
+				}
 			case <-ctx.Done(): // Check if main context cancelled
 				m.logger.WithField("objects_listed", objectCount).Info("获取对象清单中止.")
 				return
 			}
 		}
-		m.logger.WithField("total_objects_found", objectCount).Info("完成获取对象清单.")
+		fmt.Printf("\n")
+		m.logger.WithFields(logrus.Fields{
+			"total_objects_found": objectCount,
+			"total_size": fmt.Sprintf("%.2f MB", float64(totalSize)/(1024*1024)),
+		}).Info("完成获取对象清单.")
 	}()
 
 	wg.Wait() // Wait for all workers to finish
@@ -130,6 +156,12 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 		"failed":    failed,
 		"skipped":   skipped,
 	}).Info("迁移统计")
+	
+	if objectCount > 0 {
+		elapsed := time.Since(startTime).Seconds()
+		avgSpeed := float64(totalSize) / elapsed / (1024*1024)
+		fmt.Printf("\n迁移完成. 总对象数: %d, 平均速度: %.2f MB/s\n", objectCount, avgSpeed)
+	}
 
 	return nil
 }
@@ -187,61 +219,65 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 		m.logger.WithFields(logFields).WithField("previous_status", record.Status).Info("当前对象尚未完成迁移. 尝试再次迁移.")
 	}
 
-	sourceObject, err := m.sourceClient.GetObject(ctx, m.sourceBucket, obj.Key, minio.GetObjectOptions{})
-	if err != nil {
-		m.logger.WithFields(logFields).WithError(err).Error("从源桶下载对象失败")
-		_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-		return
-	}
-	defer sourceObject.Close()
+	if !m.dryrun {
+		sourceObject, err := m.sourceClient.GetObject(ctx, m.sourceBucket, obj.Key, minio.GetObjectOptions{})
+		if err != nil {
+			m.logger.WithFields(logFields).WithError(err).Error("从源桶下载对象失败")
+			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+			return
+		}
+		defer sourceObject.Close()
 
-	uploadInfo, err := m.destClient.PutObject(ctx, m.destBucket, obj.Key, sourceObject, obj.Size, minio.PutObjectOptions{
-		ContentType:  obj.ContentType,  
-		UserMetadata: obj.UserMetadata, 
-	})
-	if err != nil {
-		m.logger.WithFields(logFields).WithError(err).Error("对象上传到目标桶失败")
-		_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-		return
-	}
+		uploadInfo, err := m.destClient.PutObject(ctx, m.destBucket, obj.Key, sourceObject, obj.Size, minio.PutObjectOptions{
+			ContentType:  obj.ContentType,  
+			UserMetadata: obj.UserMetadata, 
+		})
+		if err != nil {
+			m.logger.WithFields(logFields).WithError(err).Error("对象上传到目标桶失败")
+			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+			return
+		}
 
-	if uploadInfo.Size != obj.Size {
-		m.logger.WithFields(logFields).WithFields(logrus.Fields{
-			"source_size":      obj.Size,
-			"destination_size": uploadInfo.Size,
-			"issue":            "Size mismatch",
-		}).Error("迁移验证失败: 对象大小不对")
-		_ = RecordMigration(m.db, MigrationRecord{
+		if uploadInfo.Size != obj.Size {
+			m.logger.WithFields(logFields).WithFields(logrus.Fields{
+				"source_size":      obj.Size,
+				"destination_size": uploadInfo.Size,
+				"issue":            "Size mismatch",
+			}).Error("迁移验证失败: 对象大小不对")
+			_ = RecordMigration(m.db, MigrationRecord{
+				Path:            obj.Key,
+				SourceETag:      obj.ETag,
+				SourceSize:      obj.Size,
+				DestinationETag: uploadInfo.ETag,
+				DestinationSize: uploadInfo.Size,
+				Status:          "FAILED",
+			})
+			return
+		}
+
+		sourceETag := strings.Trim(obj.ETag, `"`)
+		destETag := strings.Trim(uploadInfo.ETag, `"`)
+		if sourceETag != "" && destETag != "" && sourceETag != destETag &&
+			!strings.Contains(sourceETag, "-") && !strings.Contains(destETag, "-") {
+			m.logger.WithFields(logFields).WithFields(logrus.Fields{
+				"source_etag": sourceETag,
+				"dest_etag":   destETag,
+				"issue":       "ETag mismatch",
+				"note":        "May be due to multipart upload",
+			}).Warn("迁移验证告警: ETag不一致")
+		}
+
+		err = RecordMigration(m.db, MigrationRecord{
 			Path:            obj.Key,
 			SourceETag:      obj.ETag,
 			SourceSize:      obj.Size,
 			DestinationETag: uploadInfo.ETag,
 			DestinationSize: uploadInfo.Size,
-			Status:          "FAILED",
+			Status:          "COMPLETED",
 		})
-		return
+	} else {
+		m.logger.WithFields(logFields).WithField("object", obj.Key).Info("dryrun, 不实际下载/上传对象.")
 	}
-
-	sourceETag := strings.Trim(obj.ETag, `"`)
-	destETag := strings.Trim(uploadInfo.ETag, `"`)
-	if sourceETag != "" && destETag != "" && sourceETag != destETag &&
-		!strings.Contains(sourceETag, "-") && !strings.Contains(destETag, "-") {
-		m.logger.WithFields(logFields).WithFields(logrus.Fields{
-			"source_etag": sourceETag,
-			"dest_etag":   destETag,
-			"issue":       "ETag mismatch",
-			"note":        "May be due to multipart upload",
-		}).Warn("迁移验证告警: ETag不一致")
-	}
-
-	err = RecordMigration(m.db, MigrationRecord{
-		Path:            obj.Key,
-		SourceETag:      obj.ETag,
-		SourceSize:      obj.Size,
-		DestinationETag: uploadInfo.ETag,
-		DestinationSize: uploadInfo.Size,
-		Status:          "COMPLETED",
-	})
 	if err != nil {
 		m.logger.WithFields(logFields).WithError(err).Error("数据库记录迁移成功状态失败")
 		// This is a critical error, but migration itself was successful. Log and continue.
