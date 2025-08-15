@@ -21,14 +21,16 @@ type S3Config struct {
 type MigrationConfig struct {
 	Concurrency int    `yaml:"concurrency"`
 	DBPath      string `yaml:"db_path"`
-	
+	ToLocal     bool   `yaml:"tolocal"`
+	LocalPath   string `yaml:"localpath"`
+	Filelist    string `yaml:"filelist"`
 }
 
 // 日志设置
 type LogConfig struct {
-	Level      string `yaml:"level"`        // "debug", "info", "warn", "error"
-	OutputFile string `yaml:"output_file"`  // 日志文件路径
-	Format     string `yaml:"format"`       // "text" 或者 "json"
+	Level      string `yaml:"level"`       // "debug", "info", "warn", "error"
+	OutputFile string `yaml:"output_file"` // 日志文件路径
+	Format     string `yaml:"format"`      // "text" 或者 "json"
 }
 
 // C配置文件结构.
@@ -79,8 +81,14 @@ func (c *Config) Validate() error {
 	if c.SourceS3.Endpoint == "" || c.SourceS3.AccessKeyID == "" || c.SourceS3.SecretAccessKey == "" || c.SourceS3.Bucket == "" {
 		return fmt.Errorf("源S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
 	}
-	if c.DestinationS3.Endpoint == "" || c.DestinationS3.AccessKeyID == "" || c.DestinationS3.SecretAccessKey == "" || c.DestinationS3.Bucket == "" {
-		return fmt.Errorf("目标S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
+	if c.Migration.ToLocal {
+		if c.Migration.LocalPath == "" {
+			return fmt.Errorf("本地模式下必须指定本地路径 (local_path)")
+		}
+	} else {
+		if c.DestinationS3.Endpoint == "" || c.DestinationS3.AccessKeyID == "" || c.DestinationS3.SecretAccessKey == "" || c.DestinationS3.Bucket == "" {
+			return fmt.Errorf("目标S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
+		}
 	}
 	if c.Migration.Concurrency <= 0 {
 		return fmt.Errorf("并发设置有误")

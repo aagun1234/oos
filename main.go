@@ -52,7 +52,7 @@ func setupLogger(logConfig LogConfig) error {
 }
 
 func main() {
-	var cfg Config 
+	var cfg Config
 	configFile := flag.String("config", "config.yaml", "YAML配置文件路径，配置文件优先级大于命令行。")
 	dryrun := flag.Bool("dry", false, "dry run mode, 不进行实际复制")
 	nolog := flag.Bool("no-log", false, "不在控制台输出日志")
@@ -75,8 +75,11 @@ func main() {
 	flag.StringVar(&cfg.Logging.Level, "log-level", "", "日志等级: debug, info, warn, error (缺省: info )")
 	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "日志文件路径 (如果为空的话，输出到控制台)")
 	flag.StringVar(&cfg.Logging.Format, "log-format", "", "日志类型: text 或者 json (缺省: text)")
+	flag.BoolVar(&cfg.Migration.ToLocal, "tolocal", false, "迁移到本地模式，而不是S3到S3")
+	flag.StringVar(&cfg.Migration.LocalPath, "local-path", "", "本地存储路径，用于迁移到本地模式")
+	flag.StringVar(&cfg.Migration.Filelist, "filelist", "", "文件列表路径")
 
-	flag.Parse() 
+	flag.Parse()
 
 	err := LoadConfig(*configFile, &cfg)
 	if err != nil {
@@ -115,6 +118,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// 在cfg.ApplyDefaults()之后添加
+	if cfg.Migration.ToLocal && cfg.Migration.LocalPath == "" {
+		logger.Fatal("本地模式下必须指定本地路径 (--local-path)")
+	}
+
 	migrator, err := NewMigrator(
 		cfg.SourceS3,
 		cfg.DestinationS3,
@@ -122,6 +130,9 @@ func main() {
 		cfg.Migration.Concurrency,
 		logger, // Pass the configured logger
 		*dryrun,
+		cfg.Migration.ToLocal,
+		cfg.Migration.LocalPath,
+		cfg.Migration.Filelist,
 	)
 	if err != nil {
 		logger.Fatalf("迁移进程初始化失败: %v", err)
@@ -135,10 +146,11 @@ func main() {
 	go func() {
 		<-sigChan
 		logger.Info("退出...")
-		cancel() 
+		cancel()
 	}()
 
 	err = migrator.StartMigration(ctx)
+
 	if err != nil {
 		logger.Fatalf("迁移失败: %v", err)
 	}

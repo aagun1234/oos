@@ -1,0 +1,84 @@
+time="2025-08-14T15:46:09+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:46:30+08:00" level=fatal msg="迁移失败: 检目标桶存在失败: Get \"http://192.168.199.212:9000/test3/?location=\": dial tcp 192.168.199.212:9000: connectex: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond."
+time="2025-08-14T15:52:10+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:52:31+08:00" level=fatal msg="迁移失败: 检目标桶存在失败: Get \"http://192.168.199.212:9000/test3/?location=\": dial tcp 192.168.199.212:9000: connectex: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond."
+time="2025-08-14T15:53:46+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:53:46+08:00" level=info msg="开始迁移到本地模式" local_path="D:/dev/go/oos"
+time="2025-08-14T15:53:46+08:00" level=info msg="启动本地迁移进程." worker_id=1
+time="2025-08-14T15:53:46+08:00" level=info msg="启动本地迁移进程." worker_id=0
+time="2025-08-14T15:53:46+08:00" level=fatal msg="打开文件列表失败" error="open filelist.txt: The system cannot find the file specified."
+time="2025-08-14T15:54:31+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:54:31+08:00" level=info msg="开始迁移到本地模式" local_path="D:/dev/go/oos"
+time="2025-08-14T15:54:31+08:00" level=info msg="启动本地迁移进程." worker_id=0
+time="2025-08-14T15:54:31+08:00" level=info msg="启动本地迁移进程." worker_id=1
+time="2025-08-14T15:54:31+08:00" level=info msg="从文件列表中读取对象键" object="test1:/ws5/ws5"
+time="2025-08-14T15:54:31+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist."
+time="2025-08-14T15:54:31+08:00" level=info msg="从文件列表中读取对象键" object="test1:/ws5/ws5.exe"
+time="2025-08-14T15:54:31+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist."
+time="2025-08-14T15:54:31+08:00" level=info msg="从文件列表中读取对象键完成." objects_listed=0
+time="2025-08-14T15:54:31+08:00" level=info msg="完成获取对象清单." total_objects_found=0 total_size="0.00 MB"
+time="2025-08-14T15:54:31+08:00" level=info msg="本地迁移进程结束." worker_id=0
+time="2025-08-14T15:54:31+08:00" level=info msg="本地迁移进程结束." worker_id=1
+time="2025-08-14T15:54:31+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:54:31+08:00" level=info msg="迁移统计" completed=0 failed=0 skipped=0
+time="2025-08-14T15:54:31+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:54:40+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:54:40+08:00" level=info msg="开始迁移到本地模式" local_path="D:/dev/go/oos"
+time="2025-08-14T15:54:40+08:00" level=info msg="启动本地迁移进程." worker_id=0
+time="2025-08-14T15:54:40+08:00" level=info msg="启动本地迁移进程." worker_id=1
+time="2025-08-14T15:54:40+08:00" level=info msg="从文件列表中读取对象键" object="test1:/ws5/ws5"
+time="2025-08-14T15:54:40+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist."
+time="2025-08-14T15:54:40+08:00" level=info msg="从文件列表中读取对象键" object="test1:/ws5/ws5.exe"
+time="2025-08-14T15:54:40+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist."
+time="2025-08-14T15:54:40+08:00" level=info msg="从文件列表中读取对象键完成." objects_listed=0
+time="2025-08-14T15:54:40+08:00" level=info msg="完成获取对象清单." total_objects_found=0 total_size="0.00 MB"
+time="2025-08-14T15:54:40+08:00" level=info msg="本地迁移进程结束." worker_id=0
+time="2025-08-14T15:54:40+08:00" level=info msg="本地迁移进程结束." worker_id=1
+time="2025-08-14T15:54:40+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:54:40+08:00" level=info msg="迁移统计" completed=0 failed=0 skipped=0
+time="2025-08-14T15:54:40+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:56:35+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:56:35+08:00" level=info msg="开始迁移到本地模式" local_path="D:/dev/go/oos"
+time="2025-08-14T15:56:35+08:00" level=info msg="启动本地迁移进程." worker_id=0
+time="2025-08-14T15:56:35+08:00" level=info msg="启动本地迁移进程." worker_id=1
+time="2025-08-14T15:56:35+08:00" level=info msg="从文件列表中读取对象键" object=/ws5/ws5
+time="2025-08-14T15:56:35+08:00" level=info msg="从文件列表中读取对象键" object=/ws5/ws5.exe
+time="2025-08-14T15:56:35+08:00" level=info msg="dryrun, 不实际下载对象." object=/ws5/ws5 object_path=/ws5/ws5
+time="2025-08-14T15:56:35+08:00" level=info msg="当前对象迁移到本地完成" etag=930e7bbcf730678cdc22c6f30b13e565 object_path=/ws5/ws5 size=6725924
+time="2025-08-14T15:56:35+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist."
+time="2025-08-14T15:56:35+08:00" level=info msg="从文件列表中读取对象键完成." objects_listed=1
+time="2025-08-14T15:56:35+08:00" level=info msg="完成获取对象清单." total_objects_found=1 total_size="6.41 MB"
+time="2025-08-14T15:56:35+08:00" level=info msg="本地迁移进程结束." worker_id=1
+time="2025-08-14T15:56:35+08:00" level=info msg="本地迁移进程结束." worker_id=0
+time="2025-08-14T15:56:35+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:56:35+08:00" level=info msg="迁移统计" completed=0 failed=0 skipped=0
+time="2025-08-14T15:56:35+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:56:56+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T15:56:56+08:00" level=info msg="开始迁移到本地模式" local_path="D:/dev/go/oos"
+time="2025-08-14T15:56:56+08:00" level=info msg="启动本地迁移进程." worker_id=0
+time="2025-08-14T15:56:56+08:00" level=info msg="启动本地迁移进程." worker_id=1
+time="2025-08-14T15:56:56+08:00" level=info msg="从文件列表中读取对象键" object=/ws5/ws5
+time="2025-08-14T15:56:56+08:00" level=info msg="从文件列表中读取对象键" object=/ws5/ws5.exe
+time="2025-08-14T15:56:56+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist."
+time="2025-08-14T15:56:56+08:00" level=info msg="从文件列表中读取对象键完成." objects_listed=1
+time="2025-08-14T15:56:56+08:00" level=info msg="完成获取对象清单." total_objects_found=1 total_size="6.41 MB"
+time="2025-08-14T15:56:56+08:00" level=info msg="本地迁移进程结束." worker_id=1
+time="2025-08-14T15:56:56+08:00" level=info msg="当前对象迁移到本地完成" etag=930e7bbcf730678cdc22c6f30b13e565 object_path=/ws5/ws5 size=6725924
+time="2025-08-14T15:56:56+08:00" level=info msg="本地迁移进程结束." worker_id=0
+time="2025-08-14T15:56:56+08:00" level=info msg="迁移完成."
+time="2025-08-14T15:56:56+08:00" level=info msg="迁移统计" completed=1 failed=0 skipped=0
+time="2025-08-14T15:56:56+08:00" level=info msg="迁移完成."
+time="2025-08-14T16:02:29+08:00" level=info msg="开始迁移" concurrency=2 dest_bucket=test3 dest_endpoint="192.168.199.212:9000" prefix=ws source_bucket=test1 source_endpoint="192.168.199.211:9000"
+time="2025-08-14T16:02:29+08:00" level=info msg="开始迁移到本地模式" local_path="D:/dev/go/oos"
+time="2025-08-14T16:02:29+08:00" level=info msg="启动本地迁移进程." worker_id=0
+time="2025-08-14T16:02:29+08:00" level=info msg="启动本地迁移进程." worker_id=1
+time="2025-08-14T16:02:29+08:00" level=info msg="dryrun, 不实际下载对象." object=/ws5/ws5 object_path=/ws5/ws5
+time="2025-08-14T16:02:29+08:00" level=error msg="检查对象是否存在失败" error="The specified key does not exist." object=/ws5/ws5.exe
+time="2025-08-14T16:02:29+08:00" level=info msg="从文件列表中读取对象键完成." objects_listed=1
+time="2025-08-14T16:02:29+08:00" level=info msg="当前对象迁移到本地完成" etag=930e7bbcf730678cdc22c6f30b13e565 object_path=/ws5/ws5 size=6725924
+time="2025-08-14T16:02:29+08:00" level=info msg="完成获取对象清单." total_objects_found=1 total_size="6.41 MB"
+time="2025-08-14T16:02:29+08:00" level=info msg="本地迁移进程结束." worker_id=0
+time="2025-08-14T16:02:29+08:00" level=info msg="本地迁移进程结束." worker_id=1
+time="2025-08-14T16:02:29+08:00" level=info msg="迁移完成."
+time="2025-08-14T16:02:29+08:00" level=info msg="迁移统计" completed=0 failed=0 skipped=0
+time="2025-08-14T16:02:29+08:00" level=info msg="迁移完成."

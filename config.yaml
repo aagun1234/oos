@@ -18,7 +18,11 @@ destination_s3:
 # Migration Specific Settings
 migration:
   concurrency: 2
-  db_path: "migration_progress.db"
+  dbpath: "migration_progress.db"
+  localpath: "D:/dev/go/oos"
+  filelist: "files.txt"
+  tolocal: true
+
 
 # Logging Settings
 logging:
