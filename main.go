@@ -12,38 +12,37 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var logger *logrus.Logger // Global logger instance
+var logger *logrus.Logger
 
 func setupLogger(logConfig LogConfig) error {
 	logger = logrus.New()
 
-	// Set output
 	if logConfig.OutputFile != "" {
 		file, err := os.OpenFile(logConfig.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err == nil {
-			logger.SetOutput(io.MultiWriter(os.Stdout, file)) // Log to both console and file
+			logger.SetOutput(io.MultiWriter(os.Stdout, file)) // 同时输出到标准输出和文件
 		} else {
-			logger.SetOutput(os.Stdout) // Fallback to console if file fails
+			logger.SetOutput(os.Stdout)
 			fmt.Printf("日志记录失败 %s, 输出到标准输出: %v\n", logConfig.OutputFile, err)
 		}
 	} else {
 		logger.SetOutput(os.Stdout)
 	}
 
-	// Set format
+	// 日志格式
 	if logConfig.Format == "json" {
 		logger.SetFormatter(&logrus.JSONFormatter{})
 	} else {
-		// Default to TextFormatter with full timestamp
+
 		logger.SetFormatter(&logrus.TextFormatter{
 			FullTimestamp: true,
 		})
 	}
 
-	// Set level
+	// 日志等级
 	level, err := logrus.ParseLevel(logConfig.Level)
 	if err != nil {
-		logger.SetLevel(logrus.InfoLevel) // Default to Info if level parsing fails
+		logger.SetLevel(logrus.InfoLevel)
 		logger.Warnf("日志等级不正确 '%s', 使用缺省的 'info'. Error: %v", logConfig.Level, err)
 	} else {
 		logger.SetLevel(level)
@@ -75,7 +74,7 @@ func main() {
 	flag.StringVar(&cfg.Logging.Level, "log-level", "", "日志等级: debug, info, warn, error (缺省: info )")
 	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "日志文件路径 (如果为空的话，输出到控制台)")
 	flag.StringVar(&cfg.Logging.Format, "log-format", "", "日志类型: text 或者 json (缺省: text)")
-	flag.BoolVar(&cfg.Migration.ToLocal, "tolocal", false, "迁移到本地模式，而不是S3到S3")
+	flag.StringVar(&cfg.Migration.Direction, "direction", "", "迁移方向: tolocal, fromlocal, s3tos3 (缺省: s3tos3)")
 	flag.StringVar(&cfg.Migration.LocalPath, "local-path", "", "本地存储路径，用于迁移到本地模式")
 	flag.StringVar(&cfg.Migration.Filelist, "filelist", "", "文件列表路径")
 
@@ -111,28 +110,23 @@ func main() {
 		logger.Fatalf("配置有误: %v", err)
 	}
 
-	// 6. Open database
 	db, err := OpenDB(cfg.Migration.DBPath)
 	if err != nil {
 		logger.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
 
-	// 在cfg.ApplyDefaults()之后添加
-	if cfg.Migration.ToLocal && cfg.Migration.LocalPath == "" {
-		logger.Fatal("本地模式下必须指定本地路径 (--local-path)")
-	}
-
 	migrator, err := NewMigrator(
 		cfg.SourceS3,
 		cfg.DestinationS3,
 		db,
 		cfg.Migration.Concurrency,
-		logger, // Pass the configured logger
+		logger,
 		*dryrun,
-		cfg.Migration.ToLocal,
+		cfg.Migration.Direction,
 		cfg.Migration.LocalPath,
 		cfg.Migration.Filelist,
+		cfg.Migration.Prefix,
 	)
 	if err != nil {
 		logger.Fatalf("迁移进程初始化失败: %v", err)
@@ -149,7 +143,13 @@ func main() {
 		cancel()
 	}()
 
-	err = migrator.StartMigration(ctx)
+	if cfg.Migration.Direction == "tolocal" {
+		err = migrator.MigrateToLocal(ctx)
+	} else if cfg.Migration.Direction == "fromlocal" {
+		err = migrator.MigrateFromLocal(ctx)
+	} else if cfg.Migration.Direction == "s3tos3" {
+		err = migrator.MigrateS3ToS3(ctx)
+	}
 
 	if err != nil {
 		logger.Fatalf("迁移失败: %v", err)

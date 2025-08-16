@@ -1,10 +1,10 @@
 # Source S3 Configuration
 source_s3:
+#不带http://或者https://
   endpoint: "192.168.199.211:9000"
   access_key: "AKIAIOSFODNN7EXAMPLE"
   secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
   bucket: "test1"
-  prefix: "ws"
   use_ssl: false
 
 # Destination S3 Configuration
@@ -14,14 +14,23 @@ destination_s3:
   secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
   bucket: "test3"
   use_ssl: false
+#在fromlocal迁移时云端根路径，比如本地路径中文件上传到test3桶的go路径下
+  objpath: "go"
 
 # Migration Specific Settings
 migration:
+#并发数
   concurrency: 2
-  dbpath: "migration_progress.db"
+#记录迁移状态的sqlite数据库路径
+  db_path: "migration_progress.db"
+#S3到本地或者本地到S3迁移时本地路径，S3到本地迁移时destination_s3配置无效，本地到S3迁移时source_s3配置无效
   localpath: "D:/dev/go/oos"
+#需要迁移的文件清单，配置了文件清单后，不会遍历本地目录或者S3桶
   filelist: "files.txt"
-  tolocal: true
+#迁移方向，可以是s3tos3，tolocal或者fromlocal
+  direction: "s3tos3"
+#需要迁移对象的前缀，只迁移ws打头的
+  prefix: "ws"
 
 
 # Logging Settings

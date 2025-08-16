@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 )
@@ -14,16 +15,20 @@ type S3Config struct {
 	SecretAccessKey string `yaml:"secret_key"`
 	UseSSL          bool   `yaml:"use_ssl"`
 	Bucket          string `yaml:"bucket"`
-	Prefix          string `yaml:"prefix"`
+	ObjPath         string `yaml:"objpath"`
+	PathStyle       bool   `yaml:"path_style"`
+	Region          string `yaml:"region"`
+	Token           string `yaml:"token"`
 }
 
 // 并发、数据库位置设置.
 type MigrationConfig struct {
 	Concurrency int    `yaml:"concurrency"`
 	DBPath      string `yaml:"db_path"`
-	ToLocal     bool   `yaml:"tolocal"`
+	Direction   string `yaml:"direction"`
 	LocalPath   string `yaml:"localpath"`
 	Filelist    string `yaml:"filelist"`
+	Prefix      string `yaml:"prefix"`
 }
 
 // 日志设置
@@ -81,11 +86,25 @@ func (c *Config) Validate() error {
 	if c.SourceS3.Endpoint == "" || c.SourceS3.AccessKeyID == "" || c.SourceS3.SecretAccessKey == "" || c.SourceS3.Bucket == "" {
 		return fmt.Errorf("源S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
 	}
-	if c.Migration.ToLocal {
+	if c.Migration.Direction == "tolocal" {
 		if c.Migration.LocalPath == "" {
-			return fmt.Errorf("本地模式下必须指定本地路径 (local_path)")
+			return fmt.Errorf("迁移方向为本地时必须指定本地路径 (local_path)")
 		}
-	} else {
+		if c.SourceS3.Endpoint == "" || c.SourceS3.AccessKeyID == "" || c.SourceS3.SecretAccessKey == "" || c.SourceS3.Bucket == "" {
+			return fmt.Errorf("源S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
+		}
+	} else if c.Migration.Direction == "fromlocal" {
+		if c.Migration.LocalPath == "" {
+			return fmt.Errorf("迁移方向为从本地到S3时必须指定本地路径 (local_path)")
+
+		}
+		if c.DestinationS3.Endpoint == "" || c.DestinationS3.AccessKeyID == "" || c.DestinationS3.SecretAccessKey == "" || c.DestinationS3.Bucket == "" {
+			return fmt.Errorf("目标S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
+		}
+	} else if c.Migration.Direction == "s3tos3" {
+		if c.SourceS3.Endpoint == "" || c.SourceS3.AccessKeyID == "" || c.SourceS3.SecretAccessKey == "" || c.SourceS3.Bucket == "" {
+			return fmt.Errorf("源S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
+		}
 		if c.DestinationS3.Endpoint == "" || c.DestinationS3.AccessKeyID == "" || c.DestinationS3.SecretAccessKey == "" || c.DestinationS3.Bucket == "" {
 			return fmt.Errorf("目标S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
 		}
@@ -93,5 +112,22 @@ func (c *Config) Validate() error {
 	if c.Migration.Concurrency <= 0 {
 		return fmt.Errorf("并发设置有误")
 	}
+	if strings.HasPrefix(c.DestinationS3.ObjPath, "/") {
+		// 去掉开头的/
+		c.DestinationS3.ObjPath = c.DestinationS3.ObjPath[1:]
+	}
+	if strings.HasSuffix(c.DestinationS3.ObjPath, "/") {
+		// 去掉结尾的/
+		c.DestinationS3.ObjPath = c.DestinationS3.ObjPath[:len(c.DestinationS3.ObjPath)-1]
+	}
+	if strings.HasPrefix(c.Migration.Prefix, "/") {
+		// 去掉开头的/
+		c.Migration.Prefix = c.Migration.Prefix[1:]
+	}
+	if strings.HasSuffix(c.Migration.Prefix, "/") {
+		// 去掉结尾的/
+		c.Migration.Prefix = c.Migration.Prefix[:len(c.Migration.Prefix)-1]
+	}
+
 	return nil
 }

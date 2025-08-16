@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 
@@ -31,23 +32,40 @@ type Migrator struct {
 	dryrun       bool
 	localPath    string // 本地路径字段
 	filelist     string // 文件列表字段
-	ToLocal      bool   // 迁移到本地模式
+	Direction    string // 迁移方向
+	objPath      string // 对象路径字段
 
 }
 
-func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logger *logrus.Logger, dryrun bool, ToLocal bool, localPath string, filelist string) (*Migrator, error) {
+func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logger *logrus.Logger, dryrun bool, Direction string, localPath string, filelist string, prefix string) (*Migrator, error) {
+
+	var bucketLookupType minio.BucketLookupType
+	if sourceCfg.PathStyle {
+		bucketLookupType = minio.BucketLookupPath
+	} else {
+		bucketLookupType = minio.BucketLookupDNS
+	}
 
 	srcClient, err := minio.New(sourceCfg.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(sourceCfg.AccessKeyID, sourceCfg.SecretAccessKey, ""),
-		Secure: sourceCfg.UseSSL,
+		Creds:        credentials.NewStaticV4(sourceCfg.AccessKeyID, sourceCfg.SecretAccessKey, sourceCfg.Token),
+		Secure:       sourceCfg.UseSSL,
+		Region:       sourceCfg.Region,
+		BucketLookup: bucketLookupType,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("源S3客户端初始化失败: %w", err)
 	}
 
+	if destCfg.PathStyle {
+		bucketLookupType = minio.BucketLookupPath
+	} else {
+		bucketLookupType = minio.BucketLookupDNS
+	}
 	destClient, err := minio.New(destCfg.Endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(destCfg.AccessKeyID, destCfg.SecretAccessKey, ""),
-		Secure: destCfg.UseSSL,
+		Creds:        credentials.NewStaticV4(destCfg.AccessKeyID, destCfg.SecretAccessKey, destCfg.Token),
+		Secure:       destCfg.UseSSL,
+		Region:       destCfg.Region,
+		BucketLookup: bucketLookupType,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("目标S3客户端初始化失败: %w", err)
@@ -59,61 +77,19 @@ func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logge
 		sourceBucket: sourceCfg.Bucket,
 		destBucket:   destCfg.Bucket,
 		db:           db,
-		prefix:       sourceCfg.Prefix,
+		prefix:       prefix,
 		concurrency:  concurrency,
 		logger:       logger,
 		dryrun:       dryrun,
-		localPath:    localPath, // 本地路径
-		filelist:     filelist,  // 文件列表
-		ToLocal:      ToLocal,   // 迁移到本地模式
-
+		localPath:    localPath,       // 本地路径
+		filelist:     filelist,        // 文件列表
+		Direction:    Direction,       // 迁移方向
+		objPath:      destCfg.ObjPath, //云端路径
 	}, nil
 }
 
-func (m *Migrator) DownloadObject(ctx context.Context, objectKey string) error {
-	localPath := filepath.Join(m.localPath, objectKey)
-
-	// 创建本地目录结构
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-		return fmt.Errorf("创建目录失败: %w", err)
-	}
-
-	// 检查文件是否存在并获取已下载大小(断点续传)
-	fileInfo, err := os.Stat(localPath)
-	var offset int64 = 0
-	if err == nil {
-		offset = fileInfo.Size()
-		m.logger.WithField("object", objectKey).Infof("发现已下载部分文件(%d bytes), 继续下载", offset)
-	}
-
-	// 从S3下载对象
-	opts := minio.GetObjectOptions{}
-	if offset > 0 {
-		opts.SetRange(offset, 0) // 设置Range头实现断点续传
-	}
-
-	reader, err := m.sourceClient.GetObject(ctx, m.sourceBucket, objectKey, opts)
-	if err != nil {
-		return fmt.Errorf("获取对象失败: %w", err)
-	}
-	defer reader.Close()
-
-	// 打开文件(追加模式)
-	file, err := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("打开文件失败: %w", err)
-	}
-	defer file.Close()
-
-	// 复制数据
-	if _, err := io.Copy(file, reader); err != nil {
-		return fmt.Errorf("复制数据失败: %w", err)
-	}
-
-	return nil
-}
-
-func (m *Migrator) StartMigration(ctx context.Context) error {
+// S3->S3
+func (m *Migrator) MigrateS3ToS3(ctx context.Context) error {
 	m.logger.WithFields(logrus.Fields{
 		"source_endpoint": m.sourceClient.EndpointURL().Host,
 		"source_bucket":   m.sourceBucket,
@@ -124,29 +100,20 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 	}).Info("开始迁移")
 	objPrefix := m.prefix
 
-	if m.ToLocal {
-		m.logger.WithField("local_path", m.localPath).Info("开始迁移到本地模式")
-		// 确保本地目录存在
-		if err := os.MkdirAll(m.localPath, 0755); err != nil {
-			return fmt.Errorf("创建本地目录失败: %w", err)
-		}
-
-	} else {
-		exists, err := m.destClient.BucketExists(ctx, m.destBucket)
-		if err != nil {
-			return fmt.Errorf("检目标桶存在失败: %w", err)
-		}
-		if !exists {
-			m.logger.WithField("bucket", m.destBucket).Info("目标桶不存在， 试图创建...")
-			if !m.dryrun {
-				err = m.destClient.MakeBucket(ctx, m.destBucket, minio.MakeBucketOptions{})
-				if err != nil {
-					return fmt.Errorf("目标桶创建失败 '%s': %w", m.destBucket, err)
-				}
-				m.logger.WithField("bucket", m.destBucket).Info("目标桶创建成功.")
-			} else {
-				m.logger.WithField("bucket", m.destBucket).Info("dryrun, 不创建目标桶.")
+	exists, err := m.destClient.BucketExists(ctx, m.destBucket)
+	if err != nil {
+		return fmt.Errorf("检目标桶存在失败: %w", err)
+	}
+	if !exists {
+		m.logger.WithField("bucket", m.destBucket).Info("目标桶不存在， 试图创建...")
+		if !m.dryrun {
+			err = m.destClient.MakeBucket(ctx, m.destBucket, minio.MakeBucketOptions{})
+			if err != nil {
+				return fmt.Errorf("目标桶创建失败 '%s': %w", m.destBucket, err)
 			}
+			m.logger.WithField("bucket", m.destBucket).Info("目标桶创建成功.")
+		} else {
+			m.logger.WithField("bucket", m.destBucket).Info("dryrun, 不创建目标桶.")
 		}
 	}
 
@@ -158,15 +125,12 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 		startTime   = time.Now()
 	)
 
+	// 启动工作线程
 	for i := 0; i < m.concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			if m.ToLocal {
-				m.localWorker(ctx, workerID, objectCh)
-			} else {
-				m.S3worker(ctx, workerID, objectCh)
-			}
+			m.S3worker(ctx, workerID, objectCh)
 		}(i)
 	}
 
@@ -181,8 +145,8 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 		}
 
 		lastPrint := time.Now()
-		if m.filelist != "" {
-			// 从文件列表中读取对象键
+		if m.filelist != "" { // 从文件列表中读取对象键
+
 			file, err := os.Open(m.filelist)
 			if err != nil {
 				m.logger.WithError(err).Fatal("打开文件列表失败")
@@ -202,7 +166,6 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 				case objectCh <- object:
 					objectCount++
 
-					// Print progress every 5 seconds
 					if time.Since(lastPrint) > 5*time.Second {
 						elapsed := time.Since(startTime).Seconds()
 						bps := float64(totalSize) / elapsed
@@ -210,7 +173,7 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 						fmt.Printf("\r已迁移对象: %d/%d (%.2f MB/s)", objectCount, objectCount, bps/(1024*1024))
 						lastPrint = time.Now()
 					}
-				case <-ctx.Done(): // Check if main context cancelled
+				case <-ctx.Done():
 					m.logger.WithField("objects_listed", objectCount).Info("获取对象清单中止.")
 					return
 				}
@@ -235,7 +198,6 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 				case objectCh <- object:
 					objectCount++
 
-					// Print progress every 5 seconds
 					if time.Since(lastPrint) > 5*time.Second {
 						elapsed := time.Since(startTime).Seconds()
 						bps := float64(totalSize) / elapsed
@@ -243,7 +205,7 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 						fmt.Printf("\r已迁移对象: %d/%d (%.2f MB/s)", objectCount, objectCount, bps/(1024*1024))
 						lastPrint = time.Now()
 					}
-				case <-ctx.Done(): // Check if main context cancelled
+				case <-ctx.Done():
 					m.logger.WithField("objects_listed", objectCount).Info("获取对象清单中止.")
 					return
 				}
@@ -256,7 +218,7 @@ func (m *Migrator) StartMigration(ctx context.Context) error {
 		}).Info("完成获取对象清单.")
 	}()
 
-	wg.Wait() // Wait for all workers to finish
+	wg.Wait()
 
 	m.logger.Info("迁移完成.")
 
@@ -392,7 +354,7 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 	}
 	if err != nil {
 		m.logger.WithFields(logFields).WithError(err).Error("数据库记录迁移成功状态失败")
-		// This is a critical error, but migration itself was successful. Log and continue.
+
 	} else {
 		m.logger.WithFields(logFields).WithFields(logrus.Fields{
 			"size": obj.Size,
@@ -446,30 +408,70 @@ func (m *Migrator) MigrateToLocal(ctx context.Context) error {
 		}
 
 		lastPrint := time.Now()
-
-		for object := range m.sourceClient.ListObjects(listCtx, m.sourceBucket, opts) {
-			if object.Err != nil {
-				m.logger.WithError(object.Err).Warn("获取待迁移对象清单失败")
-				continue
+		if m.filelist != "" {
+			// 从文件列表中读取对象键
+			file, err := os.Open(m.filelist)
+			if err != nil {
+				m.logger.WithError(err).Fatal("打开文件列表失败")
 			}
+			defer file.Close()
 
-			totalSize += object.Size
-
-			select {
-			case objectCh <- object:
-				objectCount++
-
-				// 每5秒打印进度
-				if time.Since(lastPrint) > 5*time.Second {
-					elapsed := time.Since(startTime).Seconds()
-					bps := float64(totalSize) / elapsed
-
-					fmt.Printf("\r已下载对象: %d/%d (%.2f MB/s)", objectCount, objectCount, bps/(1024*1024))
-					lastPrint = time.Now()
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				objectKey := scanner.Text()
+				object, err := m.sourceClient.StatObject(listCtx, m.sourceBucket, objectKey, minio.StatObjectOptions{})
+				if err != nil {
+					m.logger.WithField("object", objectKey).WithError(err).Error("检查对象是否存在失败")
+					continue
 				}
-			case <-ctx.Done(): // 检查上下文是否取消
-				m.logger.WithField("objects_listed", objectCount).Info("获取对象清单中止.")
-				return
+				totalSize += object.Size
+				select {
+				case objectCh <- object:
+					objectCount++
+
+					if time.Since(lastPrint) > 5*time.Second {
+						elapsed := time.Since(startTime).Seconds()
+						bps := float64(totalSize) / elapsed
+
+						fmt.Printf("\r已迁移对象: %d/%d (%.2f MB/s)", objectCount, objectCount, bps/(1024*1024))
+						lastPrint = time.Now()
+					}
+				case <-ctx.Done():
+					m.logger.WithField("objects_listed", objectCount).Info("获取对象清单中止.")
+					return
+				}
+
+			}
+			if err := scanner.Err(); err != nil {
+				m.logger.WithError(err).Fatal("读取文件列表失败")
+
+			}
+			m.logger.WithField("objects_listed", objectCount).Info("从文件列表中读取对象键完成.")
+
+		} else {
+			for object := range m.sourceClient.ListObjects(listCtx, m.sourceBucket, opts) {
+				if object.Err != nil {
+					m.logger.WithError(object.Err).Warn("获取待迁移对象清单失败")
+					continue
+				}
+
+				totalSize += object.Size
+
+				select {
+				case objectCh <- object:
+					objectCount++
+
+					if time.Since(lastPrint) > 5*time.Second {
+						elapsed := time.Since(startTime).Seconds()
+						bps := float64(totalSize) / elapsed
+
+						fmt.Printf("\r已迁移对象: %d/%d (%.2f MB/s)", objectCount, objectCount, bps/(1024*1024))
+						lastPrint = time.Now()
+					}
+				case <-ctx.Done():
+					m.logger.WithField("objects_listed", objectCount).Info("获取对象清单中止.")
+					return
+				}
 			}
 		}
 		fmt.Printf("\n")
@@ -645,5 +647,329 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 			"size": obj.Size,
 			"etag": obj.ETag,
 		}).Info("当前对象迁移到本地完成")
+	}
+}
+
+// MigrateFromLocal 从本地磁盘迁移文件到对象存储
+func (m *Migrator) MigrateFromLocal(ctx context.Context) error {
+	m.logger.WithFields(logrus.Fields{
+		"local_path":    m.localPath,
+		"dest_endpoint": m.destClient.EndpointURL().Host,
+		"dest_bucket":   m.destBucket,
+		"concurrency":   m.concurrency,
+		"prefix":        m.prefix,
+	}).Info("开始从本地磁盘迁移到对象存储")
+
+	// 确保目标桶存在
+	exists, err := m.destClient.BucketExists(ctx, m.destBucket)
+	if err != nil {
+		return fmt.Errorf("检查目标桶存在失败: %w", err)
+	}
+	if !exists {
+		m.logger.WithField("bucket", m.destBucket).Info("目标桶不存在，试图创建...")
+		if !m.dryrun {
+			err = m.destClient.MakeBucket(ctx, m.destBucket, minio.MakeBucketOptions{})
+			if err != nil {
+				return fmt.Errorf("目标桶创建失败 '%s': %w", m.destBucket, err)
+			}
+			m.logger.WithField("bucket", m.destBucket).Info("目标桶创建成功.")
+		} else {
+			m.logger.WithField("bucket", m.destBucket).Info("dryrun, 不创建目标桶.")
+		}
+	}
+
+	// 创建文件通道和工作组
+	fileCh := make(chan string, m.concurrency*2)
+	var wg sync.WaitGroup
+	var (
+		fileCount int
+		totalSize int64
+		startTime = time.Now()
+	)
+
+	// 启动工作线程
+	for i := 0; i < m.concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			m.fromLocalWorker(ctx, workerID, fileCh)
+		}(i)
+	}
+
+	// 遍历本地文件并发送到通道
+	go func() {
+		defer close(fileCh)
+		lastPrint := time.Now()
+
+		// 如果指定了文件列表，从文件列表中读取
+		if m.filelist != "" {
+			file, err := os.Open(m.filelist)
+			if err != nil {
+				m.logger.WithError(err).Fatal("打开文件列表失败")
+			}
+			defer file.Close()
+
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				filePath := scanner.Text()
+				// 构建完整的本地文件路径
+				fullPath := filepath.Join(m.localPath, filePath)
+
+				// 检查文件是否存在
+				fileInfo, err := os.Stat(fullPath)
+				if err != nil {
+					m.logger.WithField("file", fullPath).WithError(err).Error("检查文件是否存在失败")
+					continue
+				}
+
+				// 跳过目录
+				if fileInfo.IsDir() {
+					continue
+				}
+
+				totalSize += fileInfo.Size()
+
+				select {
+				case fileCh <- filePath:
+					fileCount++
+
+					// 每5秒打印进度
+					if time.Since(lastPrint) > 5*time.Second {
+						elapsed := time.Since(startTime).Seconds()
+						bps := float64(totalSize) / elapsed
+
+						fmt.Printf("\r已上传文件: %d/%d (%.2f MB/s)", fileCount, fileCount, bps/(1024*1024))
+						lastPrint = time.Now()
+					}
+				case <-ctx.Done(): // 检查上下文是否取消
+					m.logger.WithField("files_listed", fileCount).Info("获取文件清单中止.")
+					return
+				}
+			}
+
+			if err := scanner.Err(); err != nil {
+				m.logger.WithError(err).Fatal("读取文件列表失败")
+			}
+
+			m.logger.WithField("files_listed", fileCount).Info("从文件列表中读取文件完成.")
+		} else {
+			// 否则，遍历本地目录
+			err := filepath.Walk(m.localPath, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					m.logger.WithField("path", path).WithError(err).Error("遍历目录失败")
+					return nil // 继续遍历
+				}
+
+				// 跳过目录
+				if info.IsDir() {
+					return nil
+				}
+				// 计算相对路径作为对象键
+				relPath, err := filepath.Rel(m.localPath, path)
+				if err != nil {
+					m.logger.WithField("path", path).WithError(err).Error("计算相对路径失败")
+					return nil
+				}
+				// 转换Windows路径分隔符为UNIX风格（对象存储使用/）
+				objKey := filepath.ToSlash(relPath)
+				if objKey == "." {
+					return nil
+				}
+				// 前缀过滤
+				if m.prefix != "" && !strings.HasPrefix(objKey, m.prefix) {
+					return nil
+				}
+				if !info.IsDir() {
+					totalSize += info.Size()
+				}
+
+				select {
+				case fileCh <- objKey:
+					fileCount++
+
+					if time.Since(lastPrint) > 5*time.Second {
+						elapsed := time.Since(startTime).Seconds()
+						bps := float64(totalSize) / elapsed
+
+						fmt.Printf("\r已上传文件: %d/%d (%.2f MB/s)", fileCount, fileCount, bps/(1024*1024))
+						lastPrint = time.Now()
+					}
+				case <-ctx.Done():
+					m.logger.WithField("files_listed", fileCount).Info("获取文件清单中止.")
+					return filepath.SkipAll
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				m.logger.WithError(err).Error("遍历本地目录失败")
+			}
+		}
+
+		fmt.Printf("\n")
+		m.logger.WithFields(logrus.Fields{
+			"total_files_found": fileCount,
+			"total_size":        fmt.Sprintf("%.2f MB", float64(totalSize)/(1024*1024)),
+		}).Info("完成获取文件清单.")
+	}()
+
+	wg.Wait() // 等待所有工作线程完成
+
+	m.logger.Info("从本地迁移到对象存储完成.")
+
+	completed, _ := CountMigratedObjects(m.db, "COMPLETED")
+	failed, _ := CountMigratedObjects(m.db, "FAILED")
+	skipped, _ := CountMigratedObjects(m.db, "SKIPPED")
+	m.logger.WithFields(logrus.Fields{
+		"completed": completed,
+		"failed":    failed,
+		"skipped":   skipped,
+	}).Info("迁移统计")
+
+	if fileCount > 0 {
+		elapsed := time.Since(startTime).Seconds()
+		avgSpeed := float64(totalSize) / elapsed / (1024 * 1024)
+		fmt.Printf("\n迁移完成. 总文件数: %d, 平均速度: %.2f MB/s\n", fileCount, avgSpeed)
+	}
+
+	return nil
+}
+
+// fromLocalWorker 处理从本地到对象存储的迁移工作
+func (m *Migrator) fromLocalWorker(ctx context.Context, workerID int, fileCh <-chan string) {
+	m.logger.WithField("worker_id", workerID).Info("启动本地到对象存储迁移进程.")
+	for {
+		select {
+		case filePath, ok := <-fileCh:
+			if !ok { // 通道关闭，没有其他文件了
+				m.logger.WithField("worker_id", workerID).Info("本地到对象存储迁移进程结束.")
+				return
+			}
+			m.migrateFileToS3(ctx, filePath)
+		case <-ctx.Done():
+			m.logger.WithField("worker_id", workerID).Warn("本地到对象存储迁移进程中止.")
+			return
+		}
+	}
+}
+
+// migrateFileToS3 将单个本地文件迁移到对象存储
+func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
+	logFields := logrus.Fields{"file_path": objKey}
+	m.logger.WithFields(logFields).Debug("处理文件")
+
+	// 构建完整的本地文件路径
+	localFilePath := filepath.Join(m.localPath, objKey)
+	remoteObjKey := filepath.Join(m.objPath, objKey)
+
+	// 获取文件信息
+	fileInfo, err := os.Stat(localFilePath)
+	if err != nil {
+		m.logger.WithFields(logFields).WithError(err).Error("获取文件信息失败")
+		_ = RecordMigration(m.db, MigrationRecord{Path: objKey, Status: "FAILED"})
+		return
+	}
+
+	// 检查迁移状态
+	record, found, err := GetMigrationStatus(m.db, objKey)
+	if err != nil {
+		m.logger.WithFields(logFields).WithError(err).Warn("数据库中对象状态未知，强制迁移.")
+	} else if found && record.Status == "COMPLETED" && record.SourceSize == fileInfo.Size() {
+		// 注意：本地文件没有ETag，只能通过大小和修改时间比较
+		m.logger.WithFields(logFields).WithFields(logrus.Fields{
+			"source_size": fileInfo.Size(),
+			"status":      "SKIPPED",
+			"reason":      "Already migrated and matches source",
+		}).Info("当前文件已迁移，跳过当前文件")
+
+		_ = RecordMigration(m.db, MigrationRecord{
+			Path:            objKey,
+			SourceSize:      fileInfo.Size(),
+			DestinationETag: record.DestinationETag,
+			DestinationSize: record.DestinationSize,
+			Status:          "SKIPPED",
+		})
+		return
+	} else if found && record.Status == "COMPLETED" && record.SourceSize != fileInfo.Size() {
+		m.logger.WithFields(logFields).WithFields(logrus.Fields{
+			"old_source_size": record.SourceSize,
+			"new_source_size": fileInfo.Size(),
+			"reason":          "Source file changed, re-migrating",
+		}).Info("当前文件已迁移，但是源文件已修改. 尝试再次迁移.")
+	} else if found && (record.Status == "FAILED" || record.Status == "SKIPPED") {
+		m.logger.WithFields(logFields).WithField("previous_status", record.Status).Info("当前文件尚未完成迁移. 尝试再次迁移.")
+	}
+
+	if !m.dryrun {
+		// 打开文件
+		file, err := os.Open(localFilePath)
+		if err != nil {
+			m.logger.WithFields(logFields).WithError(err).Error("打开本地文件失败")
+			_ = RecordMigration(m.db, MigrationRecord{Path: objKey, SourceSize: fileInfo.Size(), Status: "FAILED"})
+			return
+		}
+		defer file.Close()
+
+		// 检测内容类型
+		contentType := "application/octet-stream" // 默认二进制类型
+		buffer := make([]byte, 512)
+		_, err = file.Read(buffer)
+		if err == nil {
+			contentType = http.DetectContentType(buffer)
+			// 重置文件指针到开头
+			_, err = file.Seek(0, 0)
+			if err != nil {
+				m.logger.WithFields(logFields).WithError(err).Error("重置文件指针失败")
+				_ = RecordMigration(m.db, MigrationRecord{Path: objKey, SourceSize: fileInfo.Size(), Status: "FAILED"})
+				return
+			}
+		}
+		m.logger.WithFields(logFields).Info("处理文件" + objKey + "  to " + remoteObjKey)
+		// 上传到对象存储
+		uploadInfo, err := m.destClient.PutObject(ctx, m.destBucket, remoteObjKey, file, fileInfo.Size(), minio.PutObjectOptions{
+			ContentType: contentType,
+		})
+		if err != nil {
+			m.logger.WithFields(logFields).WithError(err).Error("文件上传到目标桶失败")
+			_ = RecordMigration(m.db, MigrationRecord{Path: objKey, SourceSize: fileInfo.Size(), Status: "FAILED"})
+			return
+		}
+
+		if uploadInfo.Size != fileInfo.Size() {
+			m.logger.WithFields(logFields).WithFields(logrus.Fields{
+				"source_size":      fileInfo.Size(),
+				"destination_size": uploadInfo.Size,
+				"issue":            "Size mismatch",
+			}).Error("迁移验证失败: 文件大小不对")
+			_ = RecordMigration(m.db, MigrationRecord{
+				Path:            objKey,
+				SourceSize:      fileInfo.Size(),
+				DestinationETag: uploadInfo.ETag,
+				DestinationSize: uploadInfo.Size,
+				Status:          "FAILED",
+			})
+			return
+		}
+
+		// 记录迁移成功
+		err = RecordMigration(m.db, MigrationRecord{
+			Path:            objKey,
+			SourceSize:      fileInfo.Size(),
+			DestinationETag: uploadInfo.ETag,
+			DestinationSize: uploadInfo.Size,
+			Status:          "COMPLETED",
+		})
+	} else {
+		m.logger.WithFields(logFields).WithField("file", objKey).Info("dryrun, 不实际上传文件.")
+	}
+
+	if err != nil {
+		m.logger.WithFields(logFields).WithError(err).Error("数据库记录迁移成功状态失败")
+		// 这是一个关键错误，但迁移本身是成功的。记录并继续。
+	} else {
+		m.logger.WithFields(logFields).WithFields(logrus.Fields{
+			"size": fileInfo.Size(),
+		}).Info("当前文件迁移到对象存储完成")
 	}
 }
