@@ -28,6 +28,7 @@ type MigrationConfig struct {
 	Direction   string `yaml:"direction"`
 	LocalPath   string `yaml:"localpath"`
 	Filelist    string `yaml:"filelist"`
+	Verify      bool   `yaml:"verify"`
 	Prefix      string `yaml:"prefix"`
 }
 

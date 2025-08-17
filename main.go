@@ -77,6 +77,7 @@ func main() {
 	flag.StringVar(&cfg.Migration.Direction, "direction", "", "迁移方向: tolocal, fromlocal, s3tos3 (缺省: s3tos3)")
 	flag.StringVar(&cfg.Migration.LocalPath, "local-path", "", "本地存储路径，用于迁移到本地模式")
 	flag.StringVar(&cfg.Migration.Filelist, "filelist", "", "文件列表路径")
+	flag.BoolVar(&cfg.Migration.Verify, "verify", false, "校验已迁移对象")
 
 	flag.Parse()
 
@@ -142,17 +143,25 @@ func main() {
 		logger.Info("退出...")
 		cancel()
 	}()
-
-	if cfg.Migration.Direction == "tolocal" {
-		err = migrator.MigrateToLocal(ctx)
-	} else if cfg.Migration.Direction == "fromlocal" {
-		err = migrator.MigrateFromLocal(ctx)
-	} else if cfg.Migration.Direction == "s3tos3" {
-		err = migrator.MigrateS3ToS3(ctx)
+	if cfg.Migration.Verify {
+		logger.Info("开始校验已迁移对象...")
+		err = migrator.VerifyMigratedObjects(ctx)
+		if err != nil {
+			logger.Fatalf("校验失败: %v", err)
+		}
+		logger.Info("校验完成.")
+	} else {
+		if cfg.Migration.Direction == "tolocal" {
+			err = migrator.MigrateToLocal(ctx)
+		} else if cfg.Migration.Direction == "fromlocal" {
+			err = migrator.MigrateFromLocal(ctx)
+		} else if cfg.Migration.Direction == "s3tos3" {
+			err = migrator.MigrateS3ToS3(ctx)
+		}
 	}
 
 	if err != nil {
 		logger.Fatalf("迁移失败: %v", err)
 	}
-	logger.Info("迁移完成.")
+
 }

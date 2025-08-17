@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/md5"
 	"database/sql"
 	"fmt"
 	"io"
@@ -89,6 +90,188 @@ func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logge
 }
 
 // S3->S3
+// VerifyMigratedObjects 校验已迁移对象
+func (m *Migrator) VerifyMigratedObjects(ctx context.Context) error {
+	m.logger.Info("开始校验已迁移对象...")
+
+	rows, err := m.db.Query("SELECT object_path, source_etag, source_size, destination_etag, destination_size FROM migrations WHERE status = ?", "COMPLETED")
+	if err != nil {
+		return fmt.Errorf("查询已迁移对象失败: %w", err)
+	}
+	defer rows.Close()
+
+	var wg sync.WaitGroup
+	objectCh := make(chan MigrationRecord, m.concurrency*2)
+
+	// 启动校验工作线程
+	for i := 0; i < m.concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.verifyWorker(ctx, objectCh)
+		}()
+	}
+
+	// 从数据库读取对象并发送到通道
+	go func() {
+		defer close(objectCh)
+		for rows.Next() {
+			var record MigrationRecord
+			err := rows.Scan(&record.Path, &record.SourceETag, &record.SourceSize, &record.DestinationETag, &record.DestinationSize)
+			if err != nil {
+				m.logger.WithError(err).Error("扫描迁移记录失败")
+				continue
+			}
+			select {
+			case objectCh <- record:
+			case <-ctx.Done():
+				m.logger.Info("校验任务被取消.")
+				return
+			}
+		}
+		if err = rows.Err(); err != nil {
+			m.logger.WithError(err).Error("遍历迁移记录失败")
+		}
+	}()
+
+	wg.Wait()
+	m.logger.Info("所有已迁移对象校验完成.")
+	return nil
+}
+
+// verifyWorker 校验工作线程
+func (m *Migrator) verifyWorker(ctx context.Context, objectCh <-chan MigrationRecord) {
+	for {
+		select {
+		case record, ok := <-objectCh:
+			if !ok {
+				return // 通道已关闭
+			}
+			m.logger.Debugf("校验对象: %s", record.Path)
+			switch m.Direction {
+			case "s3tos3":
+				m.verifyS3ToS3(ctx, record)
+			case "tolocal":
+				m.verifyS3ToLocal(ctx, record)
+			case "fromlocal":
+				m.verifyLocalToS3(ctx, record)
+			default:
+				m.logger.Warnf("不支持的迁移方向 '%s'，跳过校验对象: %s", m.Direction, record.Path)
+			}
+		case <-ctx.Done():
+			m.logger.Info("校验工作线程退出.")
+			return
+		}
+	}
+}
+
+// verifyS3ToS3 校验源S3和目标S3对象是否一致
+func (m *Migrator) verifyS3ToS3(ctx context.Context, record MigrationRecord) {
+	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, record.Path, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取源S3对象信息失败: %s", record.Path)
+		return
+	}
+
+	destObjInfo, err := m.destClient.StatObject(ctx, m.destBucket, record.Path, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取目标S3对象信息失败: %s", record.Path)
+		return
+	}
+
+	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(destObjInfo.ETag) || srcObjInfo.Size != destObjInfo.Size {
+
+		m.logger.Errorf("校验失败: %s (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d)",
+			record.Path, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size)
+	}
+}
+
+// verifyS3ToLocal 校验源S3和本地文件是否一致
+func (m *Migrator) verifyS3ToLocal(ctx context.Context, record MigrationRecord) {
+	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, record.Path, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取源S3对象信息失败: %s", record.Path)
+		return
+	}
+
+	localFilePath := filepath.Join(m.localPath, record.Path)
+	localFile, err := os.Open(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("打开本地文件失败: %s", localFilePath)
+		return
+	}
+	defer localFile.Close()
+
+	localFileInfo, err := localFile.Stat()
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取本地文件信息失败: %s", localFilePath)
+		return
+	}
+
+	// 计算本地文件的MD5 ETag
+	localFileETag, err := calculateLocalFileMD5(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
+		return
+	}
+
+	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(localFileETag) || srcObjInfo.Size != localFileInfo.Size() {
+
+		m.logger.Errorf("校验失败: %s (源ETag: %s, 本地ETag: %s, 源Size: %d, 本地Size: %d)",
+			record.Path, srcObjInfo.ETag, localFileETag, srcObjInfo.Size, localFileInfo.Size())
+	}
+}
+
+// verifyLocalToS3 校验本地文件和目标S3对象是否一致
+func (m *Migrator) verifyLocalToS3(ctx context.Context, record MigrationRecord) {
+	localFilePath := filepath.Join(m.localPath, record.Path)
+	localFile, err := os.Open(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("打开本地文件失败: %s", localFilePath)
+		return
+	}
+	defer localFile.Close()
+
+	localFileInfo, err := localFile.Stat()
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取本地文件信息失败: %s", localFilePath)
+		return
+	}
+
+	// 计算本地文件的MD5 ETag
+	localFileETag, err := calculateLocalFileMD5(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
+		return
+	}
+
+	destObjInfo, err := m.destClient.StatObject(ctx, m.destBucket, record.Path, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取目标S3对象信息失败: %s", record.Path)
+		return
+	}
+
+	if strings.ToUpper(localFileETag) != strings.ToUpper(destObjInfo.ETag) || localFileInfo.Size() != destObjInfo.Size {
+		m.logger.Errorf("校验失败: %s (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d)",
+			record.Path, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size)
+	}
+}
+
+// calculateLocalFileMD5 计算本地文件的MD5 ETag
+func calculateLocalFileMD5(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
 func (m *Migrator) MigrateS3ToS3(ctx context.Context) error {
 	m.logger.WithFields(logrus.Fields{
 		"source_endpoint": m.sourceClient.EndpointURL().Host,
@@ -126,11 +309,12 @@ func (m *Migrator) MigrateS3ToS3(ctx context.Context) error {
 	)
 
 	// 启动工作线程
+	migratedObjs := 0
 	for i := 0; i < m.concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			m.S3worker(ctx, workerID, objectCh)
+			migratedObjs = migratedObjs + m.S3worker(ctx, workerID, objectCh)
 		}(i)
 	}
 
@@ -234,30 +418,34 @@ func (m *Migrator) MigrateS3ToS3(ctx context.Context) error {
 	if objectCount > 0 {
 		elapsed := time.Since(startTime).Seconds()
 		avgSpeed := float64(totalSize) / elapsed / (1024 * 1024)
-		fmt.Printf("\n迁移完成. 总对象数: %d, 平均速度: %.2f MB/s\n", objectCount, avgSpeed)
+		fmt.Printf("\n迁移完成. 总对象数: %d, 已迁移对象数: %d, 平均速度: %.2f MB/s\n", objectCount, migratedObjs, avgSpeed)
+
 	}
 
 	return nil
 }
 
-func (m *Migrator) S3worker(ctx context.Context, workerID int, objectCh <-chan minio.ObjectInfo) {
+func (m *Migrator) S3worker(ctx context.Context, workerID int, objectCh <-chan minio.ObjectInfo) int {
 	m.logger.WithField("worker_id", workerID).Info("启动迁移进程.")
+	migratedObjs := 0
 	for {
 		select {
 		case object, ok := <-objectCh:
 			if !ok { // Channel关闭，没有其他对象了
 				m.logger.WithField("worker_id", workerID).Info("迁移进程结束.")
-				return
+				return migratedObjs
 			}
-			m.migrateObject(ctx, object)
+			migratedObjs += m.migrateObject(ctx, object)
 		case <-ctx.Done():
 			m.logger.WithField("worker_id", workerID).Warn("迁移进程中止.")
-			return
+			return migratedObjs
 		}
 	}
+
 }
 
-func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
+func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) int {
+
 	logFields := logrus.Fields{"object_path": obj.Key}
 	m.logger.WithFields(logFields).Debug("处理对象")
 
@@ -280,7 +468,7 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 			DestinationSize: record.DestinationSize,
 			Status:          "SKIPPED",
 		})
-		return
+		return 0
 	} else if found && record.Status == "COMPLETED" && (record.SourceETag != obj.ETag || record.SourceSize != obj.Size) {
 		m.logger.WithFields(logFields).WithFields(logrus.Fields{
 			"old_source_etag": record.SourceETag,
@@ -298,7 +486,8 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 		if err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("从源桶下载对象失败")
 			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-			return
+			return 0
+
 		}
 		defer sourceObject.Close()
 
@@ -309,7 +498,8 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 		if err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("对象上传到目标桶失败")
 			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-			return
+			return 0
+
 		}
 
 		if uploadInfo.Size != obj.Size {
@@ -326,7 +516,8 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 				DestinationSize: uploadInfo.Size,
 				Status:          "FAILED",
 			})
-			return
+			return 0
+
 		}
 
 		sourceETag := strings.Trim(obj.ETag, `"`)
@@ -361,6 +552,7 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) {
 			"etag": obj.ETag,
 		}).Info("当前对象迁移完成")
 	}
+	return 1
 }
 
 func (m *Migrator) MigrateToLocal(ctx context.Context) error {
@@ -388,11 +580,12 @@ func (m *Migrator) MigrateToLocal(ctx context.Context) error {
 	)
 
 	// 启动工作线程
+	migratedObjs := 0
 	for i := 0; i < m.concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			m.localWorker(ctx, workerID, objectCh)
+			migratedObjs = migratedObjs + m.localWorker(ctx, workerID, objectCh)
 		}(i)
 	}
 
@@ -497,30 +690,33 @@ func (m *Migrator) MigrateToLocal(ctx context.Context) error {
 	if objectCount > 0 {
 		elapsed := time.Since(startTime).Seconds()
 		avgSpeed := float64(totalSize) / elapsed / (1024 * 1024)
-		fmt.Printf("\n迁移完成. 总对象数: %d, 平均速度: %.2f MB/s\n", objectCount, avgSpeed)
+		fmt.Printf("\n迁移完成. 总对象数: %d, 已迁移对象数: %d, 平均速度: %.2f MB/s\n", objectCount, migratedObjs, avgSpeed)
+
 	}
 
 	return nil
 }
 
-func (m *Migrator) localWorker(ctx context.Context, workerID int, objectCh <-chan minio.ObjectInfo) {
+func (m *Migrator) localWorker(ctx context.Context, workerID int, objectCh <-chan minio.ObjectInfo) int {
 	m.logger.WithField("worker_id", workerID).Info("启动本地迁移进程.")
+	migratedObjs := 0
 	for {
 		select {
 		case object, ok := <-objectCh:
 			if !ok { // 通道关闭，没有其他对象了
 				m.logger.WithField("worker_id", workerID).Info("本地迁移进程结束.")
-				return
+				return migratedObjs
 			}
-			m.migrateObjectToLocal(ctx, object)
+			migratedObjs += m.migrateObjectToLocal(ctx, object)
 		case <-ctx.Done():
 			m.logger.WithField("worker_id", workerID).Warn("本地迁移进程中止.")
-			return
+			return migratedObjs
 		}
 	}
 }
 
-func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInfo) {
+func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInfo) int {
+
 	logFields := logrus.Fields{"object_path": obj.Key}
 	m.logger.WithFields(logFields).Debug("处理对象")
 
@@ -544,7 +740,8 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 			DestinationSize: record.DestinationSize,
 			Status:          "SKIPPED",
 		})
-		return
+		return 0
+
 	} else if found && record.Status == "COMPLETED" && (record.SourceETag != obj.ETag || record.SourceSize != obj.Size) {
 		m.logger.WithFields(logFields).WithFields(logrus.Fields{
 			"old_source_etag": record.SourceETag,
@@ -556,7 +753,7 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 	} else if found && (record.Status == "FAILED" || record.Status == "SKIPPED") {
 		m.logger.WithFields(logFields).WithField("previous_status", record.Status).Info("当前对象尚未完成迁移. 尝试再次迁移.")
 	}
-
+	var written int64 = 0
 	if !m.dryrun {
 		// 构建本地文件路径
 		localPath := filepath.Join(m.localPath, obj.Key)
@@ -565,46 +762,70 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("创建本地目录失败")
 			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-			return
+			return 0
+
 		}
 
 		// 检查文件是否存在并获取已下载大小(断点续传)
-		fileInfo, err := os.Stat(localPath)
 		var offset int64 = 0
+		fileInfo, err := os.Stat(localPath)
 		if err == nil {
 			offset = fileInfo.Size()
-			m.logger.WithField("object", obj.Key).Infof("发现已下载部分文件(%d bytes), 继续下载", offset)
+			m.logger.WithField("object", obj.Key).Debugf("发现已下载部分文件(%d bytes), 对象大小: %d", offset, obj.Size)
+
+		} else {
+			offset = -1
 		}
 
 		// 从S3下载对象
 		opts := minio.GetObjectOptions{}
-		if offset > 0 {
-			opts.SetRange(offset, 0) // 设置Range头实现断点续传
-		}
+		if obj.Size != offset {
+			if obj.Size > offset && offset > 0 {
 
-		reader, err := m.sourceClient.GetObject(ctx, m.sourceBucket, obj.Key, opts)
-		if err != nil {
-			m.logger.WithFields(logFields).WithError(err).Error("从源桶下载对象失败")
-			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-			return
-		}
-		defer reader.Close()
+				opts.SetRange(offset, 0) // 设置Range头实现断点续传
+				m.logger.WithField("object", obj.Key).Infof("设置Range头实现断点续传, 从第%d字节开始下载", offset)
 
-		// 打开文件(追加模式)
-		file, err := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			m.logger.WithFields(logFields).WithError(err).Error("打开本地文件失败")
-			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-			return
-		}
-		defer file.Close()
+			} else {
+				offset = 0
+			}
 
-		// 复制数据
-		written, err := io.Copy(file, reader)
-		if err != nil {
-			m.logger.WithFields(logFields).WithError(err).Error("复制数据失败")
-			_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-			return
+			reader, err := m.sourceClient.GetObject(ctx, m.sourceBucket, obj.Key, opts)
+			if err != nil {
+				m.logger.WithFields(logFields).WithError(err).Error("从源桶下载对象失败")
+				_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+				return 0
+
+			}
+			defer reader.Close()
+
+			// 打开文件(追加模式)
+			file, err := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				m.logger.WithFields(logFields).WithError(err).Error("打开本地文件失败")
+				_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+				return 0
+
+			}
+			defer file.Close()
+
+			// 复制数据
+			_, err = file.Seek(offset, io.SeekStart)
+			if err != nil {
+				m.logger.WithFields(logFields).WithError(err).Error("设置文件指针失败")
+				_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+				return 0
+			}
+			// 复制数据
+			written, err = io.Copy(file, reader)
+			if err != nil {
+				m.logger.WithFields(logFields).WithError(err).Error("复制数据失败")
+				_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+				return 0
+
+			}
+		} else {
+			m.logger.WithFields(logFields).WithField("object", obj.Key).Infof("文件已存在, 跳过下载, 已下载大小: %d, 对象大小: %d", offset, obj.Size)
+			written = 0
 		}
 
 		// 验证文件大小
@@ -623,7 +844,8 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 				DestinationSize: totalWritten,
 				Status:          "FAILED",
 			})
-			return
+			return 0
+
 		}
 
 		// 记录迁移成功
@@ -635,19 +857,21 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 			DestinationSize: totalWritten,
 			Status:          "COMPLETED",
 		})
+
+		if err != nil {
+			m.logger.WithFields(logFields).WithError(err).Error("数据库记录迁移成功状态失败")
+			// 这是一个关键错误，但迁移本身是成功的。记录并继续。
+		} else {
+			m.logger.WithFields(logFields).WithFields(logrus.Fields{
+				"size": obj.Size,
+				"etag": obj.ETag,
+			}).Info("当前对象迁移到本地完成")
+		}
+
 	} else {
 		m.logger.WithFields(logFields).WithField("object", obj.Key).Info("dryrun, 不实际下载对象.")
 	}
-
-	if err != nil {
-		m.logger.WithFields(logFields).WithError(err).Error("数据库记录迁移成功状态失败")
-		// 这是一个关键错误，但迁移本身是成功的。记录并继续。
-	} else {
-		m.logger.WithFields(logFields).WithFields(logrus.Fields{
-			"size": obj.Size,
-			"etag": obj.ETag,
-		}).Info("当前对象迁移到本地完成")
-	}
+	return 1
 }
 
 // MigrateFromLocal 从本地磁盘迁移文件到对象存储
@@ -688,11 +912,12 @@ func (m *Migrator) MigrateFromLocal(ctx context.Context) error {
 	)
 
 	// 启动工作线程
+	migratedObjs := 0
 	for i := 0; i < m.concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			m.fromLocalWorker(ctx, workerID, fileCh)
+			migratedObjs = migratedObjs + m.fromLocalWorker(ctx, workerID, fileCh)
 		}(i)
 	}
 
@@ -830,32 +1055,36 @@ func (m *Migrator) MigrateFromLocal(ctx context.Context) error {
 	if fileCount > 0 {
 		elapsed := time.Since(startTime).Seconds()
 		avgSpeed := float64(totalSize) / elapsed / (1024 * 1024)
-		fmt.Printf("\n迁移完成. 总文件数: %d, 平均速度: %.2f MB/s\n", fileCount, avgSpeed)
+		fmt.Printf("\n迁移完成. 总文件数: %d, 已迁移文件数: %d, 平均速度: %.2f MB/s\n", fileCount, migratedObjs, avgSpeed)
+
 	}
 
 	return nil
 }
 
 // fromLocalWorker 处理从本地到对象存储的迁移工作
-func (m *Migrator) fromLocalWorker(ctx context.Context, workerID int, fileCh <-chan string) {
+func (m *Migrator) fromLocalWorker(ctx context.Context, workerID int, fileCh <-chan string) int {
+	migratedObjs := 0
+
 	m.logger.WithField("worker_id", workerID).Info("启动本地到对象存储迁移进程.")
 	for {
 		select {
 		case filePath, ok := <-fileCh:
 			if !ok { // 通道关闭，没有其他文件了
 				m.logger.WithField("worker_id", workerID).Info("本地到对象存储迁移进程结束.")
-				return
+				return migratedObjs
 			}
-			m.migrateFileToS3(ctx, filePath)
+			migratedObjs += m.migrateFileToS3(ctx, filePath)
 		case <-ctx.Done():
 			m.logger.WithField("worker_id", workerID).Warn("本地到对象存储迁移进程中止.")
-			return
+			return migratedObjs
 		}
 	}
 }
 
 // migrateFileToS3 将单个本地文件迁移到对象存储
-func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
+func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
+
 	logFields := logrus.Fields{"file_path": objKey}
 	m.logger.WithFields(logFields).Debug("处理文件")
 
@@ -868,7 +1097,8 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 	if err != nil {
 		m.logger.WithFields(logFields).WithError(err).Error("获取文件信息失败")
 		_ = RecordMigration(m.db, MigrationRecord{Path: objKey, Status: "FAILED"})
-		return
+		return 0
+
 	}
 
 	// 检查迁移状态
@@ -890,7 +1120,8 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 			DestinationSize: record.DestinationSize,
 			Status:          "SKIPPED",
 		})
-		return
+		return 0
+
 	} else if found && record.Status == "COMPLETED" && record.SourceSize != fileInfo.Size() {
 		m.logger.WithFields(logFields).WithFields(logrus.Fields{
 			"old_source_size": record.SourceSize,
@@ -907,7 +1138,8 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 		if err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("打开本地文件失败")
 			_ = RecordMigration(m.db, MigrationRecord{Path: objKey, SourceSize: fileInfo.Size(), Status: "FAILED"})
-			return
+			return 0
+
 		}
 		defer file.Close()
 
@@ -922,7 +1154,8 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 			if err != nil {
 				m.logger.WithFields(logFields).WithError(err).Error("重置文件指针失败")
 				_ = RecordMigration(m.db, MigrationRecord{Path: objKey, SourceSize: fileInfo.Size(), Status: "FAILED"})
-				return
+				return 0
+
 			}
 		}
 		m.logger.WithFields(logFields).Info("处理文件" + objKey + "  to " + remoteObjKey)
@@ -933,7 +1166,8 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 		if err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("文件上传到目标桶失败")
 			_ = RecordMigration(m.db, MigrationRecord{Path: objKey, SourceSize: fileInfo.Size(), Status: "FAILED"})
-			return
+			return 0
+
 		}
 
 		if uploadInfo.Size != fileInfo.Size() {
@@ -949,7 +1183,8 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 				DestinationSize: uploadInfo.Size,
 				Status:          "FAILED",
 			})
-			return
+			return 0
+
 		}
 
 		// 记录迁移成功
@@ -972,4 +1207,6 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) {
 			"size": fileInfo.Size(),
 		}).Info("当前文件迁移到对象存储完成")
 	}
+	return 1
+
 }
