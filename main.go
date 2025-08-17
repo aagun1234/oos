@@ -144,7 +144,8 @@ func main() {
 		cancel()
 	}()
 	if cfg.Migration.Verify {
-		logger.Info("开始校验已迁移对象...")
+		logger.Info("开始校验已迁移对象 (仅输出失败记录)...")
+
 		err = migrator.VerifyMigratedObjects(ctx)
 		if err != nil {
 			logger.Fatalf("校验失败: %v", err)

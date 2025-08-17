@@ -92,7 +92,6 @@ func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logge
 // S3->S3
 // VerifyMigratedObjects 校验已迁移对象
 func (m *Migrator) VerifyMigratedObjects(ctx context.Context) error {
-	m.logger.Info("开始校验已迁移对象...")
 
 	rows, err := m.db.Query("SELECT object_path, source_etag, source_size, destination_etag, destination_size FROM migrations WHERE status = ?", "COMPLETED")
 	if err != nil {
@@ -104,11 +103,17 @@ func (m *Migrator) VerifyMigratedObjects(ctx context.Context) error {
 	objectCh := make(chan MigrationRecord, m.concurrency*2)
 
 	// 启动校验工作线程
+	var totalCount int
+	var successCount int
+	var failCount int
 	for i := 0; i < m.concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			m.verifyWorker(ctx, objectCh)
+			c1, c2, c3 := m.verifyWorker(ctx, objectCh)
+			totalCount += c3
+			successCount += c1
+			failCount += c2
 		}()
 	}
 
@@ -135,26 +140,42 @@ func (m *Migrator) VerifyMigratedObjects(ctx context.Context) error {
 	}()
 
 	wg.Wait()
-	m.logger.Info("所有已迁移对象校验完成.")
+	m.logger.Infof("所有已迁移对象校验完成. 总对象数: %d, 成功数: %d, 失败数: %d", totalCount, successCount, failCount)
 	return nil
 }
 
 // verifyWorker 校验工作线程
-func (m *Migrator) verifyWorker(ctx context.Context, objectCh <-chan MigrationRecord) {
+func (m *Migrator) verifyWorker(ctx context.Context, objectCh <-chan MigrationRecord) (successCount int, failCount int, totalCount int) {
+	successCount = 0
+	failCount = 0
+	totalCount = 0
 	for {
 		select {
 		case record, ok := <-objectCh:
 			if !ok {
 				return // 通道已关闭
 			}
-			m.logger.Debugf("校验对象: %s", record.Path)
+			totalCount++
 			switch m.Direction {
 			case "s3tos3":
-				m.verifyS3ToS3(ctx, record)
+				if m.verifyS3ToS3(ctx, record) == 1 {
+					successCount++
+				} else {
+					failCount++
+				}
 			case "tolocal":
-				m.verifyS3ToLocal(ctx, record)
+				if m.verifyS3ToLocal(ctx, record) == 1 {
+					successCount++
+				} else {
+					failCount++
+				}
 			case "fromlocal":
-				m.verifyLocalToS3(ctx, record)
+				if m.verifyLocalToS3(ctx, record) == 1 {
+					successCount++
+				} else {
+					failCount++
+				}
+
 			default:
 				m.logger.Warnf("不支持的迁移方向 '%s'，跳过校验对象: %s", m.Direction, record.Path)
 			}
@@ -166,95 +187,110 @@ func (m *Migrator) verifyWorker(ctx context.Context, objectCh <-chan MigrationRe
 }
 
 // verifyS3ToS3 校验源S3和目标S3对象是否一致
-func (m *Migrator) verifyS3ToS3(ctx context.Context, record MigrationRecord) {
+func (m *Migrator) verifyS3ToS3(ctx context.Context, record MigrationRecord) int {
 	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, record.Path, minio.StatObjectOptions{})
 	if err != nil {
 		m.logger.WithError(err).Errorf("获取源S3对象信息失败: %s", record.Path)
-		return
+		return 0
+
 	}
 
 	destObjInfo, err := m.destClient.StatObject(ctx, m.destBucket, record.Path, minio.StatObjectOptions{})
 	if err != nil {
 		m.logger.WithError(err).Errorf("获取目标S3对象信息失败: %s", record.Path)
-		return
+		return 0
+
 	}
 
 	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(destObjInfo.ETag) || srcObjInfo.Size != destObjInfo.Size {
 
 		m.logger.Errorf("校验失败: %s (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d)",
 			record.Path, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size)
+		return 0
 	}
+	return 1
 }
 
 // verifyS3ToLocal 校验源S3和本地文件是否一致
-func (m *Migrator) verifyS3ToLocal(ctx context.Context, record MigrationRecord) {
+func (m *Migrator) verifyS3ToLocal(ctx context.Context, record MigrationRecord) int {
 	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, record.Path, minio.StatObjectOptions{})
 	if err != nil {
 		m.logger.WithError(err).Errorf("获取源S3对象信息失败: %s", record.Path)
-		return
+		return 0
+
 	}
 
 	localFilePath := filepath.Join(m.localPath, record.Path)
 	localFile, err := os.Open(localFilePath)
 	if err != nil {
 		m.logger.WithError(err).Errorf("打开本地文件失败: %s", localFilePath)
-		return
+		return 0
+
 	}
 	defer localFile.Close()
 
 	localFileInfo, err := localFile.Stat()
 	if err != nil {
 		m.logger.WithError(err).Errorf("获取本地文件信息失败: %s", localFilePath)
-		return
+		return 0
+
 	}
 
 	// 计算本地文件的MD5 ETag
 	localFileETag, err := calculateLocalFileMD5(localFilePath)
 	if err != nil {
 		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
-		return
+		return 0
+
 	}
 
 	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(localFileETag) || srcObjInfo.Size != localFileInfo.Size() {
 
 		m.logger.Errorf("校验失败: %s (源ETag: %s, 本地ETag: %s, 源Size: %d, 本地Size: %d)",
 			record.Path, srcObjInfo.ETag, localFileETag, srcObjInfo.Size, localFileInfo.Size())
+		return 0
 	}
+	return 1
 }
 
 // verifyLocalToS3 校验本地文件和目标S3对象是否一致
-func (m *Migrator) verifyLocalToS3(ctx context.Context, record MigrationRecord) {
+func (m *Migrator) verifyLocalToS3(ctx context.Context, record MigrationRecord) int {
+
 	localFilePath := filepath.Join(m.localPath, record.Path)
 	localFile, err := os.Open(localFilePath)
 	if err != nil {
 		m.logger.WithError(err).Errorf("打开本地文件失败: %s", localFilePath)
-		return
+		return 0
+
 	}
 	defer localFile.Close()
 
 	localFileInfo, err := localFile.Stat()
 	if err != nil {
 		m.logger.WithError(err).Errorf("获取本地文件信息失败: %s", localFilePath)
-		return
+		return 0
+
 	}
 
 	// 计算本地文件的MD5 ETag
 	localFileETag, err := calculateLocalFileMD5(localFilePath)
 	if err != nil {
 		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
-		return
+		return 0
 	}
 
 	destObjInfo, err := m.destClient.StatObject(ctx, m.destBucket, record.Path, minio.StatObjectOptions{})
 	if err != nil {
 		m.logger.WithError(err).Errorf("获取目标S3对象信息失败: %s", record.Path)
-		return
+		return 0
 	}
 
 	if strings.ToUpper(localFileETag) != strings.ToUpper(destObjInfo.ETag) || localFileInfo.Size() != destObjInfo.Size {
 		m.logger.Errorf("校验失败: %s (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d)",
 			record.Path, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size)
+		return 0
 	}
+	return 1
 }
 
 // calculateLocalFileMD5 计算本地文件的MD5 ETag
