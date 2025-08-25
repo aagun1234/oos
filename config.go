@@ -23,13 +23,17 @@ type S3Config struct {
 
 // 并发、数据库位置设置.
 type MigrationConfig struct {
-	Concurrency int    `yaml:"concurrency"`
-	DBPath      string `yaml:"db_path"`
-	Direction   string `yaml:"direction"`
-	LocalPath   string `yaml:"localpath"`
-	Filelist    string `yaml:"filelist"`
-	Verify      bool   `yaml:"verify"`
-	Prefix      string `yaml:"prefix"`
+	Concurrency     int    `yaml:"concurrency"`
+	DBPath          string `yaml:"db_path"`
+	Direction       string `yaml:"direction"`
+	LocalPath       string `yaml:"localpath"`
+	Filelist        string `yaml:"filelist"`
+	Verify          bool   `yaml:"verify"`
+	VerifySample    bool   `yaml:"verify_sample"`
+	NoDBVerify      bool   `yaml:"no_db_verify"`
+	Prefix          string `yaml:"prefix"`
+	PartSize        int64  `yaml:"part_size"`
+	SampleChunkSize int64  `yaml:"sample_chunk_size"`
 }
 
 // 日志设置
@@ -80,12 +84,35 @@ func (c *Config) ApplyDefaults() {
 	if c.Logging.Format == "" {
 		c.Logging.Format = "text"
 	}
+	if c.Migration.SampleChunkSize == 0 {
+		c.Migration.SampleChunkSize = 1024 * 1024 * 1
+	}
+
 }
 
 // 配置参数检查
 func (c *Config) Validate() error {
+	if c.SourceS3.Region == "" {
+		c.SourceS3.Region = "us-east-1"
+	}
+	if c.DestinationS3.Region == "" {
+		c.DestinationS3.Region = "us-east-1"
+	}
+
 	if c.SourceS3.Endpoint == "" || c.SourceS3.AccessKeyID == "" || c.SourceS3.SecretAccessKey == "" || c.SourceS3.Bucket == "" {
 		return fmt.Errorf("源S3服务配置不全 (endpoint, access_key, secret_key, bucket)")
+	}
+	if strings.HasPrefix(c.SourceS3.Endpoint, "http://") {
+		c.SourceS3.Endpoint = strings.TrimPrefix(c.SourceS3.Endpoint, "http://")
+	}
+	if strings.HasPrefix(c.DestinationS3.Endpoint, "http://") {
+		c.DestinationS3.Endpoint = strings.TrimPrefix(c.DestinationS3.Endpoint, "http://")
+	}
+	if strings.HasPrefix(c.DestinationS3.Endpoint, "http://") {
+		c.DestinationS3.Endpoint = strings.TrimPrefix(c.DestinationS3.Endpoint, "http://")
+	}
+	if strings.HasPrefix(c.DestinationS3.Endpoint, "https://") {
+		c.DestinationS3.Endpoint = strings.TrimPrefix(c.DestinationS3.Endpoint, "https://")
 	}
 	if c.Migration.Direction == "tolocal" {
 		if c.Migration.LocalPath == "" {

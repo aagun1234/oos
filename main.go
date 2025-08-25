@@ -78,6 +78,7 @@ func main() {
 	flag.StringVar(&cfg.Migration.LocalPath, "local-path", "", "本地存储路径，用于迁移到本地模式")
 	flag.StringVar(&cfg.Migration.Filelist, "filelist", "", "文件列表路径")
 	flag.BoolVar(&cfg.Migration.Verify, "verify", false, "校验已迁移对象")
+	flag.BoolVar(&cfg.Migration.NoDBVerify, "verify2", false, "不依赖于本地数据库进行校验")
 
 	flag.Parse()
 
@@ -128,6 +129,9 @@ func main() {
 		cfg.Migration.LocalPath,
 		cfg.Migration.Filelist,
 		cfg.Migration.Prefix,
+		cfg.Migration.PartSize,
+		cfg.Migration.SampleChunkSize,
+		cfg.Migration.VerifySample,
 	)
 	if err != nil {
 		logger.Fatalf("迁移进程初始化失败: %v", err)
@@ -144,13 +148,24 @@ func main() {
 		cancel()
 	}()
 	if cfg.Migration.Verify {
-		logger.Info("开始校验已迁移对象 (仅输出失败记录)...")
-
+		logger.Info("开始校验已迁移对象...")
+		logger.Info("仅输出校验失败的信息")
 		err = migrator.VerifyMigratedObjects(ctx)
+
 		if err != nil {
 			logger.Fatalf("校验失败: %v", err)
 		}
 		logger.Info("校验完成.")
+	} else if cfg.Migration.NoDBVerify {
+		logger.Info("开始校验已迁移对象 (不依赖于本地数据库)...")
+		logger.Info("仅输出校验失败的信息")
+		err = migrator.VerifyObjectsWithoutDB(ctx)
+
+		if err != nil {
+			logger.Fatalf("校验失败: %v", err)
+		}
+		logger.Info("校验完成.")
+
 	} else {
 		if cfg.Migration.Direction == "tolocal" {
 			err = migrator.MigrateToLocal(ctx)

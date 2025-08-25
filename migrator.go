@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,26 +21,53 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/rand"
 )
 
 type Migrator struct {
-	sourceClient *minio.Client
-	destClient   *minio.Client
-	sourceBucket string
-	destBucket   string
-	db           *sql.DB
-	concurrency  int
-	prefix       string
-	logger       *logrus.Logger
-	dryrun       bool
-	localPath    string // 本地路径字段
-	filelist     string // 文件列表字段
-	Direction    string // 迁移方向
-	objPath      string // 对象路径字段
-
+	sourceClient    *minio.Client
+	destClient      *minio.Client
+	sourceBucket    string
+	destBucket      string
+	db              *sql.DB
+	concurrency     int
+	prefix          string
+	logger          *logrus.Logger
+	dryrun          bool
+	localPath       string // 本地路径字段
+	filelist        string // 文件列表字段
+	Direction       string // 迁移方向
+	objPath         string // 对象路径字段
+	partSize        int64
+	sampleChunkSize int64
+	verifySample    bool
 }
 
-func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logger *logrus.Logger, dryrun bool, Direction string, localPath string, filelist string, prefix string) (*Migrator, error) {
+func (m *Migrator) recommendedPartSize(fileSize int64) int64 {
+	recommended := int64(16 * 1024 * 1000) // 16MB默认
+	// 大文件根据配置或自动计算
+	if m.partSize > 0 {
+		return m.partSize
+	}
+	// 小文件使用单次上传
+	if fileSize <= 16*1024*1024 { // 16MB
+		return 0 // 单次上传
+	}
+
+	// 中等文件使用适中PartSize
+	if fileSize <= 100*1024*1024 { // 100MB
+		return recommended // 16MB
+	}
+
+	// 对于超大文件，可以适当增大PartSize
+	if fileSize > 10*1024*1024*1024 { // 10GB
+		recommended = 64 * 1024 * 1024 // 64MB
+	}
+
+	return recommended
+}
+
+func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logger *logrus.Logger, dryrun bool, Direction string, localPath string, filelist string, prefix string, partSize int64, sampleChunkSize int64, verifySample bool) (*Migrator, error) {
 
 	var bucketLookupType minio.BucketLookupType
 	if sourceCfg.PathStyle {
@@ -73,19 +102,22 @@ func NewMigrator(sourceCfg, destCfg S3Config, db *sql.DB, concurrency int, logge
 	}
 
 	return &Migrator{
-		sourceClient: srcClient,
-		destClient:   destClient,
-		sourceBucket: sourceCfg.Bucket,
-		destBucket:   destCfg.Bucket,
-		db:           db,
-		prefix:       prefix,
-		concurrency:  concurrency,
-		logger:       logger,
-		dryrun:       dryrun,
-		localPath:    localPath,       // 本地路径
-		filelist:     filelist,        // 文件列表
-		Direction:    Direction,       // 迁移方向
-		objPath:      destCfg.ObjPath, //云端路径
+		sourceClient:    srcClient,
+		destClient:      destClient,
+		sourceBucket:    sourceCfg.Bucket,
+		destBucket:      destCfg.Bucket,
+		db:              db,
+		prefix:          prefix,
+		concurrency:     concurrency,
+		logger:          logger,
+		dryrun:          dryrun,
+		localPath:       localPath,       // 本地路径
+		filelist:        filelist,        // 文件列表
+		Direction:       Direction,       // 迁移方向
+		objPath:         destCfg.ObjPath, //云端路径
+		partSize:        partSize,
+		sampleChunkSize: sampleChunkSize,
+		verifySample:    verifySample,
 	}, nil
 }
 
@@ -186,6 +218,146 @@ func (m *Migrator) verifyWorker(ctx context.Context, objectCh <-chan MigrationRe
 	}
 }
 
+func (m *Migrator) verifyLocalToS3Sampling(ctx context.Context, chunkSize int64, localFilePath string, s3Client *minio.Client, bucketName, objectName string) int {
+
+	localFile, err := os.Open(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("无法打开本地文件: %w", err)
+		return 0
+	}
+	defer localFile.Close()
+
+	localFileInfo, err := localFile.Stat()
+	if err != nil {
+		m.logger.WithError(err).Errorf("无法获取本地文件信息: %w", err)
+		return 0
+	}
+	localFileSize := localFileInfo.Size()
+
+	// 抽样校验：选取3个分块
+
+	offsets := []int64{0, localFileSize/2 - chunkSize/2, localFileSize - chunkSize}
+	if localFileSize <= chunkSize { // 如果文件很小，只校验开头
+		offsets = []int64{0}
+	}
+
+	for _, offset := range offsets {
+		if offset < 0 {
+			offset = 0
+		}
+		endOffset := offset + chunkSize - 1
+		if endOffset >= localFileSize {
+			endOffset = localFileSize - 1
+		}
+		length := endOffset - offset + 1
+
+		localBuffer := make([]byte, length)
+		if _, err := localFile.ReadAt(localBuffer, offset); err != nil && err != io.EOF {
+			m.logger.WithError(err).Errorf("无法读取本地文件分块: %w", err)
+			return 0
+		}
+		localMD5 := fmt.Sprintf("%x", md5.Sum(localBuffer))
+
+		opts := minio.GetObjectOptions{}
+		opts.SetRange(offset, endOffset)
+		s3Object, err := s3Client.GetObject(ctx, bucketName, objectName, opts)
+		if err != nil {
+			m.logger.WithError(err).Errorf("无法从 S3 下载分块: %w", err)
+			return 0
+		}
+		defer s3Object.Close()
+
+		s3Buffer, err := io.ReadAll(s3Object)
+		if err != nil {
+			m.logger.WithError(err).Errorf("无法读取 S3 分块内容: %w", err)
+			return 0
+		}
+		s3MD5 := fmt.Sprintf("%x", md5.Sum(s3Buffer))
+
+		if localMD5 != s3MD5 {
+			return 0
+		}
+	}
+
+	return 1
+}
+
+func (m *Migrator) verifyS3ToS3Sampling(ctx context.Context, chunkSize int64, sourceClient *minio.Client, sourceBucket, sourceObject string, targetClient *minio.Client, targetBucket, targetObject string) int {
+	sourceInfo, err := sourceClient.StatObject(ctx, sourceBucket, sourceObject, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("无法获取源 S3 对象元数据: %w", err)
+		return 0
+	}
+	sourceSize := sourceInfo.Size
+
+	targetInfo, err := targetClient.StatObject(ctx, targetBucket, targetObject, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("无法获取目标 S3 对象元数据: %w", err)
+		return 0
+	}
+	targetSize := targetInfo.Size
+	if targetSize != sourceSize {
+		return 0
+	}
+	//抽样校验：选取3个分块
+
+	offsets := []int64{0, sourceSize/2 - chunkSize/2, sourceSize - chunkSize}
+	if sourceSize <= chunkSize {
+		offsets = []int64{0}
+	}
+
+	for _, offset := range offsets {
+		if offset < 0 {
+			offset = 0
+		}
+		endOffset := offset + chunkSize - 1
+		if endOffset >= sourceSize {
+			endOffset = sourceSize - 1
+		}
+		//length := endOffset - offset + 1
+
+		// 从源 S3 分段下载分块内容
+		sourceOpts := minio.GetObjectOptions{}
+		sourceOpts.SetRange(offset, endOffset)
+		sourceObjectStream, err := sourceClient.GetObject(ctx, sourceBucket, sourceObject, sourceOpts)
+		if err != nil {
+			m.logger.WithError(err).Errorf("无法从源 S3 下载分块: %w", err)
+			return 0
+		}
+		defer sourceObjectStream.Close()
+		sourceBuffer, err := io.ReadAll(sourceObjectStream)
+		if err != nil {
+			m.logger.WithError(err).Errorf("无法读取源 S3 分块内容: %w", err)
+			return 0
+		}
+		sourceMD5 := fmt.Sprintf("%x", md5.Sum(sourceBuffer))
+
+		// 从目标 S3 分段下载分块内容
+		targetOpts := minio.GetObjectOptions{}
+		targetOpts.SetRange(offset, endOffset)
+		targetObjectStream, err := targetClient.GetObject(ctx, targetBucket, targetObject, targetOpts)
+		if err != nil {
+			m.logger.WithError(err).Errorf("无法从目标 S3 下载分块: %w", err)
+			return 0
+		}
+		defer targetObjectStream.Close()
+		targetBuffer, err := io.ReadAll(targetObjectStream)
+		if err != nil {
+			m.logger.WithError(err).Errorf("无法读取目标 S3 分块内容: %w", err)
+			return 0
+		}
+		targetMD5 := fmt.Sprintf("%x", md5.Sum(targetBuffer))
+
+		// 对比哈希值
+		if sourceMD5 != targetMD5 {
+			return 0
+		}
+
+	}
+
+	return 1
+}
+
 // verifyS3ToS3 校验源S3和目标S3对象是否一致
 func (m *Migrator) verifyS3ToS3(ctx context.Context, record MigrationRecord) int {
 	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, record.Path, minio.StatObjectOptions{})
@@ -202,11 +374,18 @@ func (m *Migrator) verifyS3ToS3(ctx context.Context, record MigrationRecord) int
 
 	}
 
-	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(destObjInfo.ETag) || srcObjInfo.Size != destObjInfo.Size {
+	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(destObjInfo.ETag) {
 
-		m.logger.Errorf("校验失败: %s (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d)",
-			record.Path, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size)
-		return 0
+		if srcObjInfo.Size != destObjInfo.Size {
+			m.logger.Errorf("校验失败: %s (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d, 上传分片大小: %d)",
+				record.Path, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size, record.ChunkSize)
+			return 0
+		} else if m.verifySample {
+			m.logger.Infof("%s ETag不一致, 尝试抽样校验 (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d, 抽样大小: %d)",
+				record.Path, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size, m.sampleChunkSize)
+			return m.verifyS3ToS3Sampling(ctx, m.sampleChunkSize, m.sourceClient, m.sourceBucket, record.Path, m.destClient, m.destBucket, record.Path)
+
+		}
 	}
 	return 1
 }
@@ -223,7 +402,8 @@ func (m *Migrator) verifyS3ToLocal(ctx context.Context, record MigrationRecord) 
 	localFilePath := filepath.Join(m.localPath, record.Path)
 	localFile, err := os.Open(localFilePath)
 	if err != nil {
-		m.logger.WithError(err).Errorf("打开本地文件失败: %s", localFilePath)
+		m.logger.WithError(err).Errorf("打开本地文件失败: %s, 对象大小: %d", localFilePath, srcObjInfo.Size)
+
 		return 0
 
 	}
@@ -237,19 +417,27 @@ func (m *Migrator) verifyS3ToLocal(ctx context.Context, record MigrationRecord) 
 	}
 
 	// 计算本地文件的MD5 ETag
-	localFileETag, err := calculateLocalFileMD5(localFilePath)
+
+	//localFileETag, err := m.calculateLocalFileETag(localFilePath)
+	localFileETag, err := m.CalculateMultipartETag(localFilePath, m.recommendedPartSize(localFileInfo.Size()))
 	if err != nil {
 		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
 		return 0
 
 	}
 
-	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(localFileETag) || srcObjInfo.Size != localFileInfo.Size() {
-
-		m.logger.Errorf("校验失败: %s (源ETag: %s, 本地ETag: %s, 源Size: %d, 本地Size: %d)",
-			record.Path, srcObjInfo.ETag, localFileETag, srcObjInfo.Size, localFileInfo.Size())
-		return 0
+	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(localFileETag) {
+		if srcObjInfo.Size != localFileInfo.Size() {
+			m.logger.Errorf("校验失败: %s (源ETag: %s, 本地ETag: %s, 源Size: %d, 本地Size: %d, 分片大小: %d)",
+				record.Path, srcObjInfo.ETag, localFileETag, srcObjInfo.Size, localFileInfo.Size(), record.ChunkSize)
+			return 0
+		} else if m.verifySample {
+			m.logger.Infof("%s ETag不一致, 尝试抽样校验 (源ETag: %s, 本地ETag: %s, 源Size: %d, 本地Size: %d, 抽样大小: %d)",
+				record.Path, srcObjInfo.ETag, localFileETag, srcObjInfo.Size, localFileInfo.Size(), m.sampleChunkSize)
+			return m.verifyLocalToS3Sampling(ctx, m.sampleChunkSize, record.Path, m.sourceClient, m.sourceBucket, record.Path)
+		}
 	}
+
 	return 1
 }
 
@@ -273,7 +461,9 @@ func (m *Migrator) verifyLocalToS3(ctx context.Context, record MigrationRecord) 
 	}
 
 	// 计算本地文件的MD5 ETag
-	localFileETag, err := calculateLocalFileMD5(localFilePath)
+	//localFileETag, err := m.calculateLocalFileETag(localFilePath)
+	localFileETag, err := m.CalculateMultipartETag(localFilePath, m.recommendedPartSize(localFileInfo.Size()))
+
 	if err != nil {
 		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
 		return 0
@@ -285,27 +475,264 @@ func (m *Migrator) verifyLocalToS3(ctx context.Context, record MigrationRecord) 
 		return 0
 	}
 
-	if strings.ToUpper(localFileETag) != strings.ToUpper(destObjInfo.ETag) || localFileInfo.Size() != destObjInfo.Size {
-		m.logger.Errorf("校验失败: %s (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d)",
-			record.Path, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size)
-		return 0
+	if strings.ToUpper(localFileETag) != strings.ToUpper(destObjInfo.ETag) {
+		if localFileInfo.Size() != destObjInfo.Size {
+			m.logger.Errorf("校验失败: %s (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d, 上传分片大小: %d)",
+				record.Path, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size, record.ChunkSize)
+			return 0
+		} else if m.verifySample {
+			m.logger.Infof("%s ETag不一致, 尝试抽样校验 (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d, 抽样大小: %d)",
+				record.Path, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size, m.sampleChunkSize)
+			return m.verifyLocalToS3Sampling(ctx, m.sampleChunkSize, record.Path, m.destClient, m.destBucket, record.Path)
+
+		}
 	}
 	return 1
 }
 
-// calculateLocalFileMD5 计算本地文件的MD5 ETag
-func calculateLocalFileMD5(filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
+// VerifyObjectsWithoutDB 校验对象，不依赖于本地数据库
+func (m *Migrator) VerifyObjectsWithoutDB(ctx context.Context) error {
+	m.logger.Info("开始不依赖数据库校验对象...")
 
-	hash := md5.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
+	objectCh := make(chan string, m.concurrency*2)
+	var wg sync.WaitGroup
+
+	// 启动校验工作线程
+	var totalCount int
+	var successCount int
+	var failCount int
+
+	for i := 0; i < m.concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			total, success, fail := m.verifyWorkerWithoutDB(ctx, objectCh)
+			totalCount += total
+			successCount += success
+			failCount += fail
+
+		}()
 	}
-	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+
+	// 获取对象列表并发送到通道
+	go func() {
+		defer close(objectCh)
+		if m.filelist != "" {
+			file, err := os.Open(m.filelist)
+			if err != nil {
+				m.logger.WithError(err).Fatal("打开文件列表失败")
+			}
+			defer file.Close()
+
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				objectKey := scanner.Text()
+				select {
+				case objectCh <- objectKey:
+				case <-ctx.Done():
+					m.logger.Info("校验任务被取消.")
+					return
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				m.logger.WithError(err).Fatal("读取文件列表失败")
+			}
+			m.logger.Info("从文件列表中读取对象键完成.")
+		} else {
+			// 从源S3桶列出对象
+			opts := minio.ListObjectsOptions{
+				Prefix:    m.prefix,
+				Recursive: true,
+			}
+			for object := range m.sourceClient.ListObjects(ctx, m.sourceBucket, opts) {
+				if object.Err != nil {
+					m.logger.WithError(object.Err).Warn("获取待校验对象清单失败")
+					continue
+				}
+				select {
+				case objectCh <- object.Key:
+				case <-ctx.Done():
+					m.logger.Info("校验任务被取消.")
+					return
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	m.logger.Infof("所有对象校验完成. 总对象数: %d, 成功数: %d, 失败数: %d", totalCount, successCount, failCount)
+	return nil
+}
+
+// verifyWorkerWithoutDB 校验工作线程 (不依赖数据库)
+func (m *Migrator) verifyWorkerWithoutDB(ctx context.Context, objectCh <-chan string) (totalCount, successCount, failCount int) {
+	totalCount = 0
+	successCount = 0
+	failCount = 0
+
+	for {
+		select {
+		case objectKey, ok := <-objectCh:
+			if !ok {
+				return // 通道已关闭
+			}
+			totalCount++
+			// 根据迁移方向调用相应的校验函数
+			switch m.Direction {
+			case "s3tos3":
+				if m.verifyS3ToS3WithoutDB(ctx, objectKey) == 1 {
+					successCount++
+				} else {
+					failCount++
+				}
+
+			case "tolocal":
+				if m.verifyS3ToLocalWithoutDB(ctx, objectKey) == 1 {
+					successCount++
+				} else {
+					failCount++
+				}
+			case "fromlocal":
+				if m.verifyLocalToS3WithoutDB(ctx, objectKey) == 1 {
+					successCount++
+				} else {
+					failCount++
+				}
+
+			default:
+				m.logger.Warnf("不支持的迁移方向 '%s'，跳过校验对象: %s", m.Direction, objectKey)
+			}
+		case <-ctx.Done():
+			m.logger.Info("校验工作线程 (无数据库) 退出.")
+			return
+		}
+	}
+}
+
+// verifyS3ToS3WithoutDB 校验源S3和目标S3对象是否一致 (无数据库)
+func (m *Migrator) verifyS3ToS3WithoutDB(ctx context.Context, objectKey string) int {
+	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取源S3对象信息失败: %s", objectKey)
+		return 0
+
+	}
+
+	destObjInfo, err := m.destClient.StatObject(ctx, m.destBucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取目标S3对象信息失败: %s", objectKey)
+		return 0
+	}
+
+	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(destObjInfo.ETag) {
+		if srcObjInfo.Size != destObjInfo.Size {
+			m.logger.Errorf("校验失败: %s (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d, 上传分片大小: %d)",
+				objectKey, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size, m.partSize)
+			return 0
+		} else if m.verifySample {
+			m.logger.Infof("%s ETag不一致, 尝试抽样校验 (源ETag: %s, 目标ETag: %s, 源Size: %d, 目标Size: %d, 抽样大小: %d)",
+				objectKey, srcObjInfo.ETag, destObjInfo.ETag, srcObjInfo.Size, destObjInfo.Size, m.sampleChunkSize)
+			return m.verifyS3ToS3Sampling(ctx, m.sampleChunkSize, m.sourceClient, m.sourceBucket, objectKey, m.destClient, m.destBucket, objectKey)
+		}
+	}
+	return 1
+}
+
+// verifyS3ToLocalWithoutDB 校验源S3和本地文件是否一致 (无数据库)
+func (m *Migrator) verifyS3ToLocalWithoutDB(ctx context.Context, objectKey string) int {
+	srcObjInfo, err := m.sourceClient.StatObject(ctx, m.sourceBucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取源S3对象信息失败: %s", objectKey)
+		return 0
+	}
+
+	localFilePath := filepath.Join(m.localPath, objectKey)
+	localFile, err := os.Open(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("打开本地文件失败: %s, 对象大小: %d", localFilePath, srcObjInfo.Size)
+
+		return 0
+	}
+	defer localFile.Close()
+
+	localFileInfo, err := localFile.Stat()
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取本地文件信息失败: %s", localFilePath)
+		return 0
+	}
+
+	//localFileETag, err := m.calculateLocalFileETag(localFilePath)
+	tag1, err1 := m.CalculateS3ETag(localFilePath, m.recommendedPartSize(localFileInfo.Size()))
+	if err1 != nil {
+		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
+	}
+
+	localFileETag, err := m.CalculateMultipartETag(localFilePath, m.recommendedPartSize(localFileInfo.Size()))
+
+	if err != nil {
+		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
+		return 0
+	}
+
+	if strings.ToUpper(srcObjInfo.ETag) != strings.ToUpper(localFileETag) {
+		if srcObjInfo.Size != localFileInfo.Size() {
+			m.logger.Errorf("校验失败: %s (源ETag: %s, 本地ETag: %s, Tag1: %s, 源Size: %d, 本地Size: %d, 分片大小: %d)",
+				objectKey, srcObjInfo.ETag, localFileETag, tag1, srcObjInfo.Size, localFileInfo.Size(), m.recommendedPartSize(localFileInfo.Size()))
+			return 0
+		} else if m.verifySample {
+			m.logger.Infof("%s ETag不一致, 尝试抽样校验 (源ETag: %s, 本地ETag: %s, 源Size: %d, 本地Size: %d, 抽样大小: %d)",
+				objectKey, srcObjInfo.ETag, localFileETag, srcObjInfo.Size, localFileInfo.Size(), m.sampleChunkSize)
+			return m.verifyLocalToS3Sampling(ctx, m.sampleChunkSize, localFilePath, m.sourceClient, m.sourceBucket, objectKey)
+
+		}
+	}
+	return 1
+}
+
+// verifyLocalToS3WithoutDB 校验本地文件和目标S3对象是否一致 (无数据库)
+func (m *Migrator) verifyLocalToS3WithoutDB(ctx context.Context, objectKey string) int {
+	localFilePath := filepath.Join(m.localPath, objectKey)
+	localFile, err := os.Open(localFilePath)
+	if err != nil {
+		m.logger.WithError(err).Errorf("打开本地文件失败: %s", localFilePath)
+		return 0
+
+	}
+	defer localFile.Close()
+
+	localFileInfo, err := localFile.Stat()
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取本地文件信息失败: %s", localFilePath)
+		return 0
+
+	}
+
+	//localFileETag, err := m.calculateLocalFileETag(localFilePath)
+	localFileETag, err := m.CalculateMultipartETag(localFilePath, m.recommendedPartSize(localFileInfo.Size()))
+	if err != nil {
+		m.logger.WithError(err).Errorf("计算本地文件MD5失败: %s", localFilePath)
+		return 0
+	}
+
+	destObjInfo, err := m.destClient.StatObject(ctx, m.destBucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		m.logger.WithError(err).Errorf("获取目标S3对象信息失败: %s", objectKey)
+		return 0
+	}
+
+	if strings.ToUpper(localFileETag) != strings.ToUpper(destObjInfo.ETag) {
+		if localFileInfo.Size() != destObjInfo.Size {
+			m.logger.Errorf("校验失败: %s (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d, 上传分片大小: %d)",
+				objectKey, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size, m.partSize)
+			return 0
+		} else if m.verifySample {
+			m.logger.Infof("%s ETag不一致, 尝试抽样校验 (本地ETag: %s, 目标ETag: %s, 本地Size: %d, 目标Size: %d, 抽样大小: %d)",
+				objectKey, localFileETag, destObjInfo.ETag, localFileInfo.Size(), destObjInfo.Size, m.sampleChunkSize)
+			return m.verifyLocalToS3Sampling(ctx, m.sampleChunkSize, localFilePath, m.destClient, m.destBucket, objectKey)
+
+		}
+	}
+	return 1
 }
 
 func (m *Migrator) MigrateS3ToS3(ctx context.Context) error {
@@ -496,14 +923,14 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) int 
 			"reason":      "Already migrated and matches source",
 		}).Info("当前对象已迁移，跳过当前对象")
 
-		_ = RecordMigration(m.db, MigrationRecord{
-			Path:            obj.Key,
-			SourceETag:      obj.ETag,
-			SourceSize:      obj.Size,
-			DestinationETag: record.DestinationETag,
-			DestinationSize: record.DestinationSize,
-			Status:          "SKIPPED",
-		})
+		//		_ = RecordMigration(m.db, MigrationRecord{
+		//			Path:            obj.Key,
+		//			SourceETag:      obj.ETag,
+		//			SourceSize:      obj.Size,
+		//			DestinationETag: record.DestinationETag,
+		//			DestinationSize: record.DestinationSize,
+		//			Status:          "SKIPPED",
+		//		})
 		return 0
 	} else if found && record.Status == "COMPLETED" && (record.SourceETag != obj.ETag || record.SourceSize != obj.Size) {
 		m.logger.WithFields(logFields).WithFields(logrus.Fields{
@@ -526,10 +953,11 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) int 
 
 		}
 		defer sourceObject.Close()
-
+		chunkSize := m.recommendedPartSize(obj.Size)
 		uploadInfo, err := m.destClient.PutObject(ctx, m.destBucket, obj.Key, sourceObject, obj.Size, minio.PutObjectOptions{
 			ContentType:  obj.ContentType,
 			UserMetadata: obj.UserMetadata,
+			PartSize:     uint64(chunkSize),
 		})
 		if err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("对象上传到目标桶失败")
@@ -547,6 +975,7 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) int 
 			_ = RecordMigration(m.db, MigrationRecord{
 				Path:            obj.Key,
 				SourceETag:      obj.ETag,
+				ChunkSize:       chunkSize,
 				SourceSize:      obj.Size,
 				DestinationETag: uploadInfo.ETag,
 				DestinationSize: uploadInfo.Size,
@@ -571,6 +1000,7 @@ func (m *Migrator) migrateObject(ctx context.Context, obj minio.ObjectInfo) int 
 		err = RecordMigration(m.db, MigrationRecord{
 			Path:            obj.Key,
 			SourceETag:      obj.ETag,
+			ChunkSize:       chunkSize,
 			SourceSize:      obj.Size,
 			DestinationETag: uploadInfo.ETag,
 			DestinationSize: uploadInfo.Size,
@@ -768,14 +1198,14 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 			"reason":      "Already migrated and matches source",
 		}).Info("当前对象已迁移，跳过当前对象")
 
-		_ = RecordMigration(m.db, MigrationRecord{
-			Path:            obj.Key,
-			SourceETag:      obj.ETag,
-			SourceSize:      obj.Size,
-			DestinationETag: record.DestinationETag,
-			DestinationSize: record.DestinationSize,
-			Status:          "SKIPPED",
-		})
+		//		_ = RecordMigration(m.db, MigrationRecord{
+		//			Path:            obj.Key,
+		//			SourceETag:      obj.ETag,
+		//			SourceSize:      obj.Size,
+		//			DestinationETag: record.DestinationETag,
+		//			DestinationSize: record.DestinationSize,
+		//			Status:          "SKIPPED",
+		//		})
 		return 0
 
 	} else if found && record.Status == "COMPLETED" && (record.SourceETag != obj.ETag || record.SourceSize != obj.Size) {
@@ -823,6 +1253,8 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 
 			} else {
 				offset = 0
+				file, _ := os.OpenFile(localPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+				file.Close()
 			}
 
 			reader, err := m.sourceClient.GetObject(ctx, m.sourceBucket, obj.Key, opts)
@@ -854,9 +1286,12 @@ func (m *Migrator) migrateObjectToLocal(ctx context.Context, obj minio.ObjectInf
 			// 复制数据
 			written, err = io.Copy(file, reader)
 			if err != nil {
-				m.logger.WithFields(logFields).WithError(err).Error("复制数据失败")
-				_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
-				return 0
+				written = 0
+				if obj.Size != 0 {
+					m.logger.WithFields(logFields).WithError(err).Error("复制数据失败")
+					_ = RecordMigration(m.db, MigrationRecord{Path: obj.Key, SourceETag: obj.ETag, SourceSize: obj.Size, Status: "FAILED"})
+					return 0
+				}
 
 			}
 		} else {
@@ -1149,13 +1584,13 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
 			"reason":      "Already migrated and matches source",
 		}).Info("当前文件已迁移，跳过当前文件")
 
-		_ = RecordMigration(m.db, MigrationRecord{
-			Path:            objKey,
-			SourceSize:      fileInfo.Size(),
-			DestinationETag: record.DestinationETag,
-			DestinationSize: record.DestinationSize,
-			Status:          "SKIPPED",
-		})
+		//		_ = RecordMigration(m.db, MigrationRecord{
+		//			Path:            objKey,
+		//			SourceSize:      fileInfo.Size(),
+		//			DestinationETag: record.DestinationETag,
+		//			DestinationSize: record.DestinationSize,
+		//			Status:          "SKIPPED",
+		//		})
 		return 0
 
 	} else if found && record.Status == "COMPLETED" && record.SourceSize != fileInfo.Size() {
@@ -1178,7 +1613,7 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
 
 		}
 		defer file.Close()
-
+		chunkSize := m.recommendedPartSize(fileInfo.Size())
 		// 检测内容类型
 		contentType := "application/octet-stream" // 默认二进制类型
 		buffer := make([]byte, 512)
@@ -1198,6 +1633,7 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
 		// 上传到对象存储
 		uploadInfo, err := m.destClient.PutObject(ctx, m.destBucket, remoteObjKey, file, fileInfo.Size(), minio.PutObjectOptions{
 			ContentType: contentType,
+			PartSize:    uint64(chunkSize),
 		})
 		if err != nil {
 			m.logger.WithFields(logFields).WithError(err).Error("文件上传到目标桶失败")
@@ -1215,6 +1651,7 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
 			_ = RecordMigration(m.db, MigrationRecord{
 				Path:            objKey,
 				SourceSize:      fileInfo.Size(),
+				ChunkSize:       chunkSize,
 				DestinationETag: uploadInfo.ETag,
 				DestinationSize: uploadInfo.Size,
 				Status:          "FAILED",
@@ -1227,6 +1664,7 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
 		err = RecordMigration(m.db, MigrationRecord{
 			Path:            objKey,
 			SourceSize:      fileInfo.Size(),
+			ChunkSize:       chunkSize,
 			DestinationETag: uploadInfo.ETag,
 			DestinationSize: uploadInfo.Size,
 			Status:          "COMPLETED",
@@ -1245,4 +1683,287 @@ func (m *Migrator) migrateFileToS3(ctx context.Context, objKey string) int {
 	}
 	return 1
 
+}
+func (m *Migrator) verifyWithSampling(ctx context.Context, sourceClient, destClient *minio.Client,
+	srcBucket, srcKey, destBucket, destKey string, samplePoints int) (bool, error) {
+
+	// 获取对象大小
+	srcInfo, err := sourceClient.StatObject(ctx, srcBucket, srcKey, minio.StatObjectOptions{})
+	if err != nil {
+		return false, err
+	}
+	destInfo, err := destClient.StatObject(ctx, destBucket, destKey, minio.StatObjectOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	// 首先验证大小一致
+	if srcInfo.Size != destInfo.Size {
+		return false, nil
+	}
+
+	// 随机采样几个点进行验证
+	for i := 0; i < samplePoints; i++ {
+		offset := rand.Int63n(srcInfo.Size - 1024) // 随机位置，读取1KB
+		if offset < 0 {
+			offset = 0
+		}
+
+		// 读取源对象片段
+		srcOpts := minio.GetObjectOptions{}
+		srcOpts.SetRange(offset, offset+1023)
+		srcPart, err := sourceClient.GetObject(ctx, srcBucket, srcKey, srcOpts)
+		if err != nil {
+			return false, err
+		}
+		srcData, _ := io.ReadAll(srcPart)
+		srcPart.Close()
+
+		// 读取目标对象片段
+		destOpts := minio.GetObjectOptions{}
+		destOpts.SetRange(offset, offset+1023)
+		destPart, err := destClient.GetObject(ctx, destBucket, destKey, destOpts)
+		if err != nil {
+			return false, err
+		}
+		destData, _ := io.ReadAll(destPart)
+		destPart.Close()
+
+		if !bytes.Equal(srcData, destData) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (m *Migrator) calculateObjectMD5(ctx context.Context, client *minio.Client, bucket, key string) (string, error) {
+	object, err := client.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return "", err
+	}
+	defer object.Close()
+
+	hasher := md5.New()
+	_, err = io.Copy(hasher, object)
+	if err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// calculateLocalFileMD5 计算本地文件的MD5 ETag
+func (m *Migrator) calculateLocalFileMD5(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func (m *Migrator) calculateLocalFileETag(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("failed to get file info: %v", err)
+	}
+
+	fileSize := fileInfo.Size()
+	partSize := m.recommendedPartSize(fileSize)
+
+	if fileSize <= partSize || partSize == 0 {
+		// 小文件，直接计算MD5
+		return m.calculateLocalFileMD5(filePath)
+	}
+
+	// 计算需要多少分段
+
+	numParts := fileSize / partSize
+	if fileSize%partSize != 0 {
+		numParts++
+	}
+	m.logger.WithFields(logrus.Fields{
+		"fileSize": fileSize,
+		"partSize": partSize,
+		"numParts": numParts,
+	}).Info("文件分片")
+	var partMD5s [][]byte
+	buffer := make([]byte, partSize)
+
+	for partNumber := int64(1); partNumber <= numParts; partNumber++ {
+		// 读取分段
+		bytesRead, err := file.Read(buffer)
+		if err != nil && err != io.EOF {
+			return "", fmt.Errorf("failed to read part %d: %v", partNumber, err)
+		}
+
+		if bytesRead == 0 {
+			break
+		}
+
+		// 计算当前分段的MD5
+		hash := md5.Sum(buffer[:bytesRead])
+		// 将MD5解码为二进制格式（16字节）
+		binMD5, err := hex.DecodeString(hex.EncodeToString(hash[:]))
+		if err != nil {
+			return "", fmt.Errorf("failed to decode MD5: %v", err)
+		}
+
+		partMD5s = append(partMD5s, binMD5)
+	}
+
+	// 连接所有分段的二进制MD5值
+	var combinedMD5s []byte
+	for _, binMD5 := range partMD5s {
+		combinedMD5s = append(combinedMD5s, binMD5...)
+	}
+
+	// 计算连接后的MD5
+	finalHash := md5.Sum(combinedMD5s)
+	expectedETag := fmt.Sprintf("%s-%d", hex.EncodeToString(finalHash[:]), len(partMD5s))
+
+	return expectedETag, nil
+}
+
+// CalculateS3MultipartETag 严格遵循AWS S3分片上传ETag计算规则
+func (m *Migrator) CalculateMultipartETag(filename string, chunkSize int64) (string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	fileSize := fileInfo.Size()
+	if fileSize == 0 {
+		return "d41d8cd98f00b204e9800998ecf8427e", nil
+	}
+	if chunkSize == 0 {
+		return m.calculateSinglePartETag(file)
+	}
+	// 计算分片数量
+	numChunks := (fileSize + chunkSize - 1) / chunkSize
+	if numChunks == 1 {
+		// 单文件ETag计算
+		return m.calculateSinglePartETag(file)
+	}
+
+	// 存储每个分片的MD5二进制数据（不是十六进制字符串）
+	var chunkMD5s []byte
+
+	for i := int64(0); i < numChunks; i++ {
+		// 计算当前分片的起始位置和大小
+		offset := i * chunkSize
+		remaining := fileSize - offset
+		currentChunkSize := chunkSize
+		if remaining < chunkSize {
+			currentChunkSize = remaining
+		}
+
+		// 读取精确的分片数据
+		buffer := make([]byte, currentChunkSize)
+		_, err = file.ReadAt(buffer, offset)
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+
+		// 计算分片的MD5（二进制格式）
+		hash := md5.Sum(buffer)
+		chunkMD5s = append(chunkMD5s, hash[:]...) // 追加二进制MD5，不是字符串
+	}
+
+	// 计算所有分片MD5二进制数据连接后的MD5
+	finalHash := md5.Sum(chunkMD5s)
+	etag := hex.EncodeToString(finalHash[:]) + "-" + fmt.Sprintf("%d", numChunks)
+
+	return etag, nil
+}
+
+// calculateS3SinglePartETag 计算单文件ETag
+func (m *Migrator) calculateSinglePartETag(file *os.File) (string, error) {
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	etag := hex.EncodeToString(hash.Sum(nil))
+	return etag, nil
+}
+
+func (m *Migrator) CalculateS3ETag(fileName string, chunkSize int64) (string, error) {
+	// 1. 打开文件并获取文件信息
+	file, err := os.Open(fileName)
+	if err != nil {
+		return "", fmt.Errorf("无法打开文件 %s: %w", fileName, err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("无法获取文件信息: %w", err)
+	}
+
+	// 特殊情况：处理0字节的文件
+	if fileInfo.Size() == 0 {
+		// 0字节文件的ETag是其内容的MD5值，即空字符串的MD5
+		return "d41d8cd98f00b204e9800998ecf8427e", nil
+	}
+
+	if chunkSize == 0 {
+		return m.calculateSinglePartETag(file)
+	}
+	// 注意：如果通过分片上传API上传一个0字节文件，S3可能不允许。
+	// 但如果文件存在且为0字节，从逻辑上讲这是其ETag。
+
+	// 创建用于计算最终ETag的哈希器
+	finalHasher := md5.New()
+	partCount := 0
+
+	// 创建一个可复用的缓冲区
+	buffer := make([]byte, chunkSize)
+
+	for {
+		// 从文件读取一个分片的数据
+		bytesRead, err := file.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return "", fmt.Errorf("读取文件分片时出错: %w", err)
+		}
+
+		partCount++
+
+		// 创建临时的哈希器计算当前分片的MD5
+		partHasher := md5.New()
+		partHasher.Write(buffer[:bytesRead])
+		partMD5 := partHasher.Sum(nil)
+
+		// **核心优化点**: 立即将分片的MD5二进制值写入最终的哈希器
+		// 而不是存储在切片中
+		finalHasher.Write(partMD5)
+	}
+
+	// 计算拼接后数据的最终MD5
+	finalMD5 := finalHasher.Sum(nil)
+
+	// 格式化ETag字符串
+	etag := fmt.Sprintf("%x-%d", finalMD5, partCount)
+
+	return etag, nil
 }

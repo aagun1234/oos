@@ -31,6 +31,11 @@ migration:
   direction: "s3tos3"
 #需要迁移对象的前缀，只迁移ws打头的
   prefix: "ws"
+#上传分片大小，单位字节
+  chunksize: 16777216
+#抽样校验，单位字节
+  samplechunksize: 1048576
+  verify_sample: true
 
 
 # Logging Settings

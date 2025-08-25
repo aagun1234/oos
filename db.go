@@ -10,13 +10,14 @@ import (
 )
 
 type MigrationRecord struct {
-	Path           string
-	SourceETag     string
-	SourceSize     int64
+	Path            string
+	SourceETag      string
+	SourceSize      int64
+	ChunkSize       int64
 	DestinationETag string
 	DestinationSize int64
-	Status         string // "COMPLETED", "FAILED", "SKIPPED"
-	MigratedAt     time.Time
+	Status          string // "COMPLETED", "FAILED", "SKIPPED"
+	MigratedAt      time.Time
 }
 
 func OpenDB(dbPath string) (*sql.DB, error) {
@@ -31,6 +32,7 @@ func OpenDB(dbPath string) (*sql.DB, error) {
 		object_path TEXT NOT NULL UNIQUE,
 		source_etag TEXT,
 		source_size INTEGER,
+		chunk_size INTEGER,
 		destination_etag TEXT,
 		destination_size INTEGER,
 		status TEXT NOT NULL,
@@ -47,8 +49,8 @@ func OpenDB(dbPath string) (*sql.DB, error) {
 func RecordMigration(db *sql.DB, record MigrationRecord) error {
 	stmt, err := db.Prepare(`
 		INSERT OR REPLACE INTO migrations (
-			object_path, source_etag, source_size, destination_etag, destination_size, status, migrated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?);
+			object_path, source_etag, source_size, chunk_size, destination_etag, destination_size, status, migrated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 	`)
 	if err != nil {
 		return fmt.Errorf("[数据库] 数据库错误: %w", err)
@@ -59,6 +61,7 @@ func RecordMigration(db *sql.DB, record MigrationRecord) error {
 		record.Path,
 		record.SourceETag,
 		record.SourceSize,
+		record.ChunkSize,
 		record.DestinationETag,
 		record.DestinationSize,
 		record.Status,
@@ -70,10 +73,9 @@ func RecordMigration(db *sql.DB, record MigrationRecord) error {
 	return nil
 }
 
-
 func GetMigrationStatus(db *sql.DB, objectPath string) (MigrationRecord, bool, error) {
 	row := db.QueryRow(`
-		SELECT object_path, source_etag, source_size, destination_etag, destination_size, status, migrated_at
+		SELECT object_path, source_etag, source_size, chunk_size, destination_etag, destination_size, status, migrated_at
 		FROM migrations WHERE object_path = ?;
 	`, objectPath)
 
@@ -83,13 +85,14 @@ func GetMigrationStatus(db *sql.DB, objectPath string) (MigrationRecord, bool, e
 		&record.Path,
 		&record.SourceETag,
 		&record.SourceSize,
+		&record.ChunkSize,
 		&record.DestinationETag,
 		&record.DestinationSize,
 		&record.Status,
 		&migratedAtStr,
 	)
 	if err == sql.ErrNoRows {
-		return MigrationRecord{}, false, nil 
+		return MigrationRecord{}, false, nil
 	}
 	if err != nil {
 		return MigrationRecord{}, false, fmt.Errorf("[数据库] 查询迁移信息失败: %w", err)
@@ -102,7 +105,6 @@ func GetMigrationStatus(db *sql.DB, objectPath string) (MigrationRecord, bool, e
 
 	return record, true, nil
 }
-
 
 func CountMigratedObjects(db *sql.DB, status string) (int, error) {
 	var count int
